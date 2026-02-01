@@ -61,5 +61,13 @@ This runs the example in `inferface.py` (ensure `model_path` points to your Qwen
 | `language` | Language (e.g. `"English"`) |
 | `speaker` | Speaker name (e.g. `"Vivian"`) |
 
+## Latency
+on Nvidia L4:
+```
+RTF: 0.6
+First chunk latency: 0.1269s  <- Can be faster if use input streaming
+Inner chunk latency: 0.0491s
+```
+
 ## Note
 Current only support custom voice model
