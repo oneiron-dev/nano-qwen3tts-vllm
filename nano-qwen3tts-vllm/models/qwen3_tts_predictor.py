@@ -17,13 +17,16 @@ from nano_qwen3tts_vllm.layers.layernorm import Qwen3TTSRMSNorm
 from nano_qwen3tts_vllm.models.qwen3_tts_share import Qwen3TTSDecoderLayer
 
 class Qwen3TTSCodePredictorModel(nn.Module):
-    def __init__(self, config):
+    def __init__(self, config, talker_config=None):
         super().__init__()
         self.vocab_size = config.vocab_size
+        
+        codec_embedding_dim = talker_config.hidden_size if talker_config else config.hidden_size
+         
         self.layers = nn.ModuleList([Qwen3TTSDecoderLayer(config) for _ in range(config.num_hidden_layers)])
         self.norm = Qwen3TTSRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.codec_embedding = nn.ModuleList(
-            [nn.Embedding(config.vocab_size, config.hidden_size) for _ in range(config.num_code_groups - 1)]
+            [nn.Embedding(config.vocab_size, codec_embedding_dim) for _ in range(config.num_code_groups - 1)]
         )
 
     def forward(
@@ -46,10 +49,12 @@ class Qwen3TTSCodePredictorModel(nn.Module):
 class Qwen3TTSCodePredictorForCausalLM(nn.Module):
     def __init__(self, config, talker_config):
         super().__init__()
-        self.model = Qwen3TTSCodePredictorModel(config)
+        self.model = Qwen3TTSCodePredictorModel(config, talker_config)
         self.vocab_size = config.vocab_size
+        
+        print(config.hidden_size, talker_config.hidden_size)
         self.lm_head = nn.ModuleList(
-            [nn.Linear(config.hidden_size, config.vocab_size, bias=False) for _ in range(config.num_code_groups - 1)]
+            [nn.Linear(config.hidden_size, talker_config.hidden_size, bias=False) for _ in range(config.num_code_groups - 1)]
         )
         
         if config.hidden_size != talker_config.hidden_size:
