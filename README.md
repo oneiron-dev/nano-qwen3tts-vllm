@@ -316,9 +316,7 @@ wavs, sr = interface.generate_custom_voice(
 - ✅ Support for all model types (CustomVoice, VoiceDesign, Base)
 - ✅ Voice clone with ICL and x_vector modes
 - ✅ Voice design from text descriptions
-- ⏳ Chunk prefill for smaller first chunk latency
 - ⏳ Make prefill stage run with CUDA Graph
-- ⏳ Multi-GPU tensor parallelism optimization
 
 ## Star History
 ![Star History Chart](https://api.star-history.com/svg?repos=tsdocode/nano-qwen3tts-vllm&type=Date)
