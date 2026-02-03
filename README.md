@@ -2,6 +2,13 @@
 
 Qwen3-TTS with nano vLLM-style optimizations for fast text-to-speech generation.
 
+## Author note
+This project was born after I tested the Qwen3-TTS model and realized the RTF (Real-Time Factor) remained stubbornly high, even on an H100. It sparked an idea: could we create a **"nano-vllm" moment** for Qwen3TTS? My goal is to match the efficiency of vLLM implementation within a concise, ~1k line codebase.
+
+I am building this while diving deep into both the [nano-vllm](https://github.com/GeeeekExplorer/nano-vllm) and [Qwen3TTS](https://github.com/QwenLM/Qwen3-TTS) source code. I anticipate some hurdles along the way and would appreciate any insights or feedback from the community.
+
+Optimization for the Qwen3-TTS model will continue in the (vllm-omni](https://github.com/vllm-project/vllm-omni) repo—stay tuned for updates!
+
 ## Highlights
 
 ### Performance Optimizations
