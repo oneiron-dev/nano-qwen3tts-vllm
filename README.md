@@ -352,7 +352,7 @@ wavs, sr = interface.speech_tokenizer.decode([{"audio_codes": audio_codes}])
 - ⏳ Make prefill stage run with CUDA Graph
 
 ## Star History
-![Star History Chart](https://api.star-history.com/svg?repos=tsdocode/nano-qwen3tts-vllm&type=Date)
+![Star History Chart](https://api.star-history.com/svg?repos=tsdocode/nano-qwen3tts-vllm&type=Date?l=1)
 
 
 
