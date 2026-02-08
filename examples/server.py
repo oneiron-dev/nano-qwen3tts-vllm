@@ -9,15 +9,17 @@ Env:
 import asyncio
 import logging
 import os
+import pickle
 import time
 import threading
 from contextlib import asynccontextmanager
+from pathlib import Path
 import numpy as np
 import torch
 from fastapi import FastAPI, HTTPException
 from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field
-
+import functools
 # Output format: 16-bit PCM at 24 kHz
 TARGET_SAMPLE_RATE = 24000
 
@@ -26,7 +28,7 @@ logger = logging.getLogger(__name__)
 # Ensure log messages appear on console (works when run as uvicorn server:app or python server.py)
 if not logging.getLogger().handlers:
     _handler = logging.StreamHandler()
-    _handler.setFormatter(logging.Formatter("%(asctime)s %(levelname)s [%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    _handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)s [%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
     logging.getLogger().addHandler(_handler)
     logging.getLogger().setLevel(logging.DEBUG if os.environ.get("DEBUG_TTS") else logging.INFO)
 
@@ -35,6 +37,15 @@ _interface = None
 _tokenizer = None
 _zmq_bridge = None
 _decode_lock = threading.Lock()
+
+# Default speakers for CustomVoice model
+DEFAULT_SPEAKERS = [
+   
+]
+
+# Voice clones directory (same as gradio app)
+VOICES_DIR = Path(__file__).parent / "voices"
+VOICES_DIR.mkdir(exist_ok=True)
 
 
 def _use_zmq():
@@ -47,11 +58,10 @@ def get_interface():
     global _interface, _zmq_bridge
     if _interface is None:
         from nano_qwen3tts_vllm.interface import Qwen3TTSInterface
-        model_path = os.environ.get("QWEN3_TTS_MODEL_PATH", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice")
+        model_path = os.environ.get("QWEN3_TTS_MODEL_PATH", "Qwen/Qwen3-TTS-12Hz-1.7B-Base")
         
         # Check if it's a local path or HuggingFace model ID
-        import os as os_module
-        if os_module.isdir(model_path) or os_module.isfile(model_path):
+        if os.path.isdir(model_path) or os.path.isfile(model_path):
             # Local path - use regular init
             if _use_zmq():
                 from nano_qwen3tts_vllm.zmq import ZMQOutputBridge
@@ -147,6 +157,22 @@ async def health():
     return {"status": "ok"}
 
 
+@app.get("/voices")
+async def list_voices():
+    """
+    List all available voices (default speakers + voice clones).
+    Returns a dictionary with 'default' and 'clones' keys.
+    """
+    default_voices = DEFAULT_SPEAKERS
+    voice_clones = get_voice_clones()
+    
+    return {
+        "default": default_voices,
+        "clones": voice_clones,
+        "all": default_voices + voice_clones,
+    }
+
+
 def _float_to_pcm16(wav: np.ndarray) -> np.ndarray:
     """Convert float32 [-1, 1] to int16 PCM."""
     wav = np.clip(wav, -1.0, 1.0)
@@ -174,37 +200,102 @@ def _decode_batch(tokenizer, audio_codes: list) -> tuple[np.ndarray, int]:
     return _float_to_pcm16(wav_24k), TARGET_SAMPLE_RATE
 
 
+def get_voice_clones():
+    """Get list of saved voice clone names from the voices directory."""
+    if not VOICES_DIR.exists():
+        return []
+    voice_files = list(VOICES_DIR.glob("*.pkl"))
+    voice_names = [f.stem for f in voice_files]
+    return sorted(voice_names)
+
+
+def is_voice_clone(speaker: str) -> bool:
+    """Check if speaker is a voice clone (exists in voices directory)."""
+    return (VOICES_DIR / f"{speaker}.pkl").exists()
+
+
+@functools.lru_cache(maxsize=128)
+def load_voice_clone_prompt(speaker: str):
+    """Load voice clone prompt from pickle file."""
+    voice_path = VOICES_DIR / f"{speaker}.pkl"
+    if not voice_path.exists():
+        raise ValueError(f"Voice clone '{speaker}' not found")
+    with open(voice_path, 'rb') as f:
+        return pickle.load(f)
+
+
+
+
 async def generate_speech_stream(request: SpeechRequest):
     """
     Streaming decode: producer (generation) and consumer (decode) run concurrently.
     Uses single asyncio.Queue + run_in_executor — no decode thread, no call_soon_threadsafe.
     When consumer awaits decode in executor, event loop runs producer (overlap).
+    Supports both default voices (via generate_custom_voice_async) and voice clones (via generate_voice_clone_async).
     """
     interface = get_interface()
     tokenizer = get_tokenizer()
     loop = asyncio.get_event_loop()
     codes_queue: asyncio.Queue[list | None] = asyncio.Queue(maxsize=2)  # backpressure
+    
     async def producer() -> None:
         audio_codes = []
         first_chunk_time = None
         last_chunk_time = None
+        start_time = time.time()
         try:
-            async for audio_code in interface.generate_custom_voice_async(
-                text=request.text,
-                language=request.language,
-                speaker=request.speaker,
-            ):
-                current_time = time.time()
-                if first_chunk_time is None:
-                    first_chunk_time = current_time
-                if last_chunk_time is not None:
-                    inner_latency = current_time - last_chunk_time
-                    print(f"[producer] inner chunk latency: {inner_latency*1000:.2f}ms")
-                last_chunk_time = current_time
+            # Check if this is a voice clone
+            if is_voice_clone(request.speaker):
+                print(f"[producer] Loading voice clone: {request.speaker}")
+                # Load voice clone prompt
+                voice_clone_prompt = load_voice_clone_prompt(request.speaker)
+                print(f"[producer] Voice clone prompt: {voice_clone_prompt}")
                 
-                audio_codes.append(audio_code)
-                if len(audio_codes) % 4 == 0:  # decode every 4 chunks
-                    await codes_queue.put(list(audio_codes))
+                print(f"[producer] Voice clone prompt loaded for: {request.speaker}")
+                print(f"[producer] request: {request.text}")
+                
+                count = 0
+                
+                # Use generate_voice_clone_async (native async method)
+                async for audio_code in interface.generate_voice_clone_async(
+                    text=request.text,
+                    language=request.language,
+                    voice_clone_prompt=voice_clone_prompt,
+                ):
+                    current_time = time.time()
+                    if first_chunk_time is None:
+                        first_chunk_time = current_time
+                        logger.info(f"[producer] First chunk latency: {first_chunk_time - start_time:.3f}s")
+                    if last_chunk_time is not None:
+                        inner_latency = current_time - last_chunk_time
+                        logger.info(f"[producer] inner chunk latency: {inner_latency*1000:.2f}ms")
+                    last_chunk_time = current_time
+                    
+                    audio_codes.append(audio_code)
+                    print(f"Chunk: {len(audio_codes)}")
+                    
+                    
+                    if len(audio_codes) % 4 == 0:  # decode every 4 chunks
+                        logger.info(f"[producer] Queuing batch of {len(audio_codes)} audio codes")
+                        await codes_queue.put(list(audio_codes))
+            else:
+                # Use default voice (generate_custom_voice_async)
+                async for audio_code in interface.generate_custom_voice_async(
+                    text=request.text,
+                    language=request.language,
+                    speaker=request.speaker,
+                ):
+                    current_time = time.time()
+                    if first_chunk_time is None:
+                        first_chunk_time = current_time
+                    if last_chunk_time is not None:
+                        inner_latency = current_time - last_chunk_time
+                        print(f"[producer] inner chunk latency: {inner_latency*1000:.2f}ms")
+                    last_chunk_time = current_time
+                    
+                    audio_codes.append(audio_code)
+                    if len(audio_codes) % 4 == 0:  # decode every 4 chunks
+                        await codes_queue.put(list(audio_codes))
             
             if first_chunk_time is not None:
                 first_chunk_latency = last_chunk_time - first_chunk_time
@@ -261,6 +352,7 @@ async def root():
         "name": "Qwen3-TTS API",
         "docs": "/docs",
         "health": "/health",
+        "voices": "GET /voices (list all available voices)",
         "speech": "POST /v1/audio/speech (PCM16, 24 kHz mono)",
         "zmq": _use_zmq(),
     }
