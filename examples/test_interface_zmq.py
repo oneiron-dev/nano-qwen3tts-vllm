@@ -25,6 +25,18 @@ import asyncio
 import os
 import sys
 import time
+import logging
+
+
+logger = logging.getLogger(__name__)
+
+# Ensure log messages appear on console (works when run as uvicorn server:app or python server.py)
+if not logging.getLogger().handlers:
+    _handler = logging.StreamHandler()
+    _handler.setFormatter(logging.Formatter("%(asctime)s.%(msecs)03d %(levelname)s [%(name)s] %(message)s", datefmt="%Y-%m-%d %H:%M:%S"))
+    logging.getLogger().addHandler(_handler)
+    logging.getLogger().setLevel(logging.DEBUG if os.environ.get("DEBUG_TTS") else logging.INFO)
+
 
 
 # Add parent so we can import nano_qwen3tts_vllm
@@ -127,20 +139,26 @@ async def main():
     first_chunk_time = None
     last_chunk_time = None
     start_time = time.time()
-    async for chunk in interface.generate_custom_voice_async(text=text, language=language, speaker=speaker):
-        current_time = time.time()
-        if first_chunk_time is None:
-            first_chunk_time = current_time
-            first_chunk_latency = current_time - start_time
-            print(f"      chunk #{len(audio_codes) + 1}: {len(chunk)} codes (first chunk latency: {first_chunk_latency:.3f}s)")
-        else:
-            inner_latency = current_time - last_chunk_time if last_chunk_time else 0
-            print(f"      chunk #{len(audio_codes) + 1}: {len(chunk)} codes (inner latency: {inner_latency:.3f}s)")
-        audio_codes.append(chunk)
-        last_chunk_time = current_time
-    
-    total_time = time.time() - start_time
-    print(f"      ✓ Received {len(audio_codes)} chunks total in {total_time:.3f}s")
+    try:
+        async for chunk in interface.generate_custom_voice_async(text=text, language=language, speaker=speaker):
+            current_time = time.time()
+            if first_chunk_time is None:
+                first_chunk_time = current_time
+                first_chunk_latency = current_time - start_time
+                print(f"      chunk #{len(audio_codes) + 1}: {len(chunk)} codes (first chunk latency: {first_chunk_latency:.3f}s)")
+            else:
+                inner_latency = current_time - last_chunk_time if last_chunk_time else 0
+                print(f"      chunk #{len(audio_codes) + 1}: {len(chunk)} codes (inner latency: {inner_latency:.3f}s)")
+            audio_codes.append(chunk)
+            last_chunk_time = current_time
+        
+        total_time = time.time() - start_time
+        print(f"      ✓ Received {len(audio_codes)} chunks total in {total_time:.3f}s")
+    except Exception as e:
+        import traceback
+        traceback.print_exc()
+        print(f"      ✗ Error generating: {e}")
+        sys.exit(1)
 
     if not audio_codes:
         print("[FAIL] No audio chunks received.")

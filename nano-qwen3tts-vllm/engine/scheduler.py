@@ -30,7 +30,6 @@ class Scheduler:
 
         # decode (priority)
         while self.running and num_seqs < self.max_num_seqs:
-            logger.info(f"[scheduler] Running sequences: {len(self.running)}")
             seq = self.running.popleft()
             while not self.block_manager.can_append(seq):
                 if self.running:
@@ -45,12 +44,11 @@ class Scheduler:
 
         if scheduled_seqs:
             self.running.extendleft(reversed(scheduled_seqs))
-            logger.info(f"[scheduler] Scheduled {len(scheduled_seqs)} sequences for decode")
+            logger.debug(f"[scheduler] Scheduled {len(scheduled_seqs)} sequences for decode (running={len(self.running)})")
             return scheduled_seqs, False
 
         # prefill
         while self.waiting and num_seqs < self.max_num_seqs:
-            logger.info(f"[scheduler] Waiting sequences: {len(self.waiting)}")
             seq = self.waiting[0]
             if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
                 break
@@ -63,7 +61,7 @@ class Scheduler:
             scheduled_seqs.append(seq)
 
         assert scheduled_seqs
-        logger.info(f"[scheduler] Scheduled {len(scheduled_seqs)} sequences for prefill")
+        logger.debug(f"[scheduler] Scheduled {len(scheduled_seqs)} sequences for prefill (waiting={len(self.waiting)})")
         return scheduled_seqs, True
 
     def preempt(self, seq: Sequence):

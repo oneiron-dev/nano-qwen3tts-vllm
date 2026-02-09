@@ -15,6 +15,7 @@ from __future__ import annotations
 import torch
 from typing import Callable, Optional, Union, List
 
+@torch.inference_mode()
 def prepare_inputs(
     config,
     input_ids: list[torch.Tensor],

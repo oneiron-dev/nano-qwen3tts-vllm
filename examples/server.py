@@ -36,6 +36,13 @@ if not logging.getLogger().handlers:
 _interface = None
 _tokenizer = None
 _zmq_bridge = None
+
+# --- Batched decode system (replaces _decode_lock) ---
+# Instead of serializing decode with a threading.Lock, requests submit to a
+# queue and a background worker batches them into fewer decode calls.
+_decode_queue: asyncio.Queue = None
+_decode_worker_task: asyncio.Task = None
+# Fallback lock for sync warm-up path only (not used in async serving)
 _decode_lock = threading.Lock()
 
 # Default speakers for CustomVoice model
@@ -121,14 +128,52 @@ def get_tokenizer():
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    """Startup: warm up model and start ZMQ tasks when USE_ZMQ. Shutdown: stop ZMQ tasks and close bridge."""
+    """Startup: warm up model, start ZMQ tasks and decode worker. Shutdown: stop all."""
+    global _decode_queue, _decode_worker_task
+
     interface = get_interface()
     get_tokenizer()
     if _use_zmq() and interface.zmq_bridge is not None:
         await interface.start_zmq_tasks()
-        
-    generate_speech_stream(SpeechRequest(text="Hello, this is a test.", language="English", speaker="Vivian"))
+
+    # Start batched decode worker
+    _decode_queue = asyncio.Queue()
+    _decode_worker_task = asyncio.create_task(_decode_worker_loop())
+
+    # Warmup: run concurrent requests to compile CUDA kernels for all batch sizes.
+    # Without this, the first batch=8 request triggers kernel compilation (~400ms extra).
+    # We ramp from 1→8 so kernels for every batch size 1..8 are cached.
+    async def _warmup_one(req):
+        try:
+            async for _ in generate_speech_stream(req):
+                pass
+        except Exception as e:
+            logger.warning(f"[warmup] error (non-fatal): {e}")
+
+    warmup_text = "Hello, this is a warmup test."
+    # Use voice clone if Anna exists, otherwise default speaker
+    if is_voice_clone("Anna"):
+        warmup_req = SpeechRequest(text=warmup_text, language="English", speaker="Anna")
+    else:
+        warmup_req = SpeechRequest(text=warmup_text, language="English", speaker="Vivian")
+
+    # Batch=1 warmup (also warms _do_prep, prefill, predictor, decode)
+    logger.info("[warmup] batch=1 ...")
+    await _warmup_one(warmup_req)
+
+    # Batch=8 warmup (compiles kernels for larger matmul shapes)
+    logger.info("[warmup] batch=8 ...")
+    await asyncio.gather(*[_warmup_one(warmup_req) for _ in range(8)])
+    logger.info("[warmup] done.")
+
     yield
+
+    # Stop decode worker
+    if _decode_queue is not None:
+        await _decode_queue.put(None)  # sentinel
+    if _decode_worker_task is not None:
+        await _decode_worker_task
+
     if _use_zmq() and _interface is not None and _interface.zmq_bridge is not None:
         await _interface.stop_zmq_tasks()
         if _zmq_bridge is not None:
@@ -191,12 +236,84 @@ def _resample_to_24k(wav: np.ndarray, orig_sr: int) -> np.ndarray:
     return np.interp(indices, np.arange(n_orig), wav).astype(np.float32)
 
 
-def _decode_batch(tokenizer, audio_codes: list) -> tuple[np.ndarray, int]:
-    """Decode cumulative audio_codes to PCM16 @ 24kHz. Returns (pcm16, sample_rate)."""
+def _decode_batch_sync(tokenizer, audio_codes: list) -> tuple[np.ndarray, int]:
+    """Sync decode (for warm-up only). Uses _decode_lock."""
     with _decode_lock:
         wav_list, sr = tokenizer.decode([{"audio_codes": audio_codes}])
     wav = wav_list[0]
     wav_24k = _resample_to_24k(wav, sr)
+    return _float_to_pcm16(wav_24k), TARGET_SAMPLE_RATE
+
+async def _decode_worker_loop():
+    """Background asyncio task: collects decode requests from _decode_queue,
+    micro-batches them, and runs decode in an executor.
+
+    Each queue item is a dict: {"audio_codes": list, "future": asyncio.Future}.
+    The worker waits for the first item, then drains any additional queued items
+    into a single batched decode call, delivering results to each future.
+    """
+    decode_start = time.time()
+    tokenizer = get_tokenizer()
+    loop = asyncio.get_event_loop()
+    while True:
+        # Wait for first request
+        item = await _decode_queue.get()
+        if item is None:
+            break
+        batch = [item]
+
+        # Drain any queued requests (micro-batch)
+        while not _decode_queue.empty():
+            try:
+                extra = _decode_queue.get_nowait()
+                if extra is None:
+                    break
+                batch.append(extra)
+            except asyncio.QueueEmpty:
+                break
+
+        # Batched decode: combine all into one call
+        all_inputs = [{"audio_codes": req["audio_codes"]} for req in batch]
+
+        def _do_decode(inputs=all_inputs):
+            return tokenizer.decode(inputs)
+
+        try:
+            decode_start = time.time()
+            wav_results, sr = await loop.run_in_executor(None, _do_decode)
+            decode_latency = (time.time() - decode_start) * 1000
+            logger.info(f"[decoder] batch_size={len(batch)} latency={decode_latency:.2f}ms")
+            for req, wav in zip(batch, wav_results):
+                wav_24k = _resample_to_24k(wav, sr)
+                pcm16 = _float_to_pcm16(wav_24k)
+                if not req["future"].done():
+                    req["future"].set_result((pcm16, TARGET_SAMPLE_RATE))
+        except Exception as e:
+            for req in batch:
+                if not req["future"].done():
+                    req["future"].set_exception(e)
+                    
+        logger.info(f"[decoder] total latency: {time.time() - decode_start:.2f}s")
+
+
+async def _decode_batched(audio_codes: list) -> tuple[np.ndarray, int]:
+    """Submit a decode request to the batched worker and await the result."""
+    future = asyncio.get_event_loop().create_future()
+    await _decode_queue.put({"audio_codes": audio_codes, "future": future})
+    return await future
+
+
+def _decode_inline(audio_codes: list) -> tuple[np.ndarray, int]:
+    """Decode directly on the calling thread (no executor).
+
+    Used for FIRST-chunk decode to avoid the ~130ms scheduling delay caused by
+    run_in_executor callback delivery competing with GPU prefills on the event loop.
+    Single-code CUDA-graph decode takes ~15ms, acceptable for inline use.
+    """
+    tokenizer = get_tokenizer()
+    with torch.inference_mode():
+        wav_list, sr = tokenizer.decode([{"audio_codes": audio_codes}])
+    wav_24k = _resample_to_24k(wav_list[0], sr)
     return _float_to_pcm16(wav_24k), TARGET_SAMPLE_RATE
 
 
@@ -228,105 +345,99 @@ def load_voice_clone_prompt(speaker: str):
 
 async def generate_speech_stream(request: SpeechRequest):
     """
-    Streaming decode: producer (generation) and consumer (decode) run concurrently.
-    Uses single asyncio.Queue + run_in_executor — no decode thread, no call_soon_threadsafe.
-    When consumer awaits decode in executor, event loop runs producer (overlap).
-    Supports both default voices (via generate_custom_voice_async) and voice clones (via generate_voice_clone_async).
+    Streaming decode: first chunk decoded inline for minimal latency,
+    subsequent chunks use producer/consumer with batched decode worker.
+
+    Key insight: putting the first code through codes_queue → consumer adds
+    ~130ms scheduling delay (consumer competes with talker/predictor for event
+    loop time). By awaiting the first code directly via __anext__() and decoding
+    inline, we eliminate that delay entirely.
     """
-    interface = get_interface()
-    tokenizer = get_tokenizer()
-    loop = asyncio.get_event_loop()
-    codes_queue: asyncio.Queue[list | None] = asyncio.Queue(maxsize=2)  # backpressure
-    
-    async def producer() -> None:
-        audio_codes = []
-        first_chunk_time = None
-        last_chunk_time = None
-        start_time = time.time()
-        try:
-            # Check if this is a voice clone
-            if is_voice_clone(request.speaker):
-                print(f"[producer] Loading voice clone: {request.speaker}")
-                # Load voice clone prompt
-                voice_clone_prompt = load_voice_clone_prompt(request.speaker)
-                print(f"[producer] Voice clone prompt: {voice_clone_prompt}")
-                
-                print(f"[producer] Voice clone prompt loaded for: {request.speaker}")
-                print(f"[producer] request: {request.text}")
-                
-                count = 0
-                
-                # Use generate_voice_clone_async (native async method)
-                async for audio_code in interface.generate_voice_clone_async(
-                    text=request.text,
-                    language=request.language,
-                    voice_clone_prompt=voice_clone_prompt,
-                ):
-                    current_time = time.time()
-                    if first_chunk_time is None:
-                        first_chunk_time = current_time
-                        logger.info(f"[producer] First chunk latency: {first_chunk_time - start_time:.3f}s")
-                    if last_chunk_time is not None:
-                        inner_latency = current_time - last_chunk_time
-                        logger.info(f"[producer] inner chunk latency: {inner_latency*1000:.2f}ms")
-                    last_chunk_time = current_time
-                    
-                    audio_codes.append(audio_code)
-                    print(f"Chunk: {len(audio_codes)}")
-                    
-                    
-                    if len(audio_codes) % 4 == 0:  # decode every 4 chunks
-                        logger.info(f"[producer] Queuing batch of {len(audio_codes)} audio codes")
-                        await codes_queue.put(list(audio_codes))
-            else:
-                # Use default voice (generate_custom_voice_async)
-                async for audio_code in interface.generate_custom_voice_async(
-                    text=request.text,
-                    language=request.language,
-                    speaker=request.speaker,
-                ):
-                    current_time = time.time()
-                    if first_chunk_time is None:
-                        first_chunk_time = current_time
-                    if last_chunk_time is not None:
-                        inner_latency = current_time - last_chunk_time
-                        print(f"[producer] inner chunk latency: {inner_latency*1000:.2f}ms")
-                    last_chunk_time = current_time
-                    
-                    audio_codes.append(audio_code)
-                    if len(audio_codes) % 4 == 0:  # decode every 4 chunks
-                        await codes_queue.put(list(audio_codes))
-            
-            if first_chunk_time is not None:
-                first_chunk_latency = last_chunk_time - first_chunk_time
-                print(f"[producer] first chunk latency: {first_chunk_latency*1000:.2f}ms")
-            
-            # final batch if not already sent (e.g. 13 chunks: sent at 12, need 13)
-            if audio_codes and len(audio_codes) % 4 != 0:
-                await codes_queue.put(list(audio_codes))
-        finally:
-            await codes_queue.put(None)  # sentinel
-
-    producer_task = asyncio.create_task(producer())
-    prev_len_24k = 0
-
     try:
-        while True:
-            item = await codes_queue.get()
-            if item is None:
-                break
-            # run_in_executor: decode in thread pool; event loop runs producer meanwhile
-            pcm16, _ = await loop.run_in_executor(
-                None,
-                lambda c=item: _decode_batch(tokenizer, c),
-            )
-            chunk = pcm16[prev_len_24k:].tobytes()
-            prev_len_24k = len(pcm16)
-            if chunk:
-                yield chunk
-    finally:
-        await producer_task
+        interface = get_interface()
+        tokenizer = get_tokenizer()
+        loop = asyncio.get_event_loop()
+        start_time = time.time()
 
+        # --- Create the async generator (voice clone or custom voice) ---
+        if is_voice_clone(request.speaker):
+            voice_clone_prompt = load_voice_clone_prompt(request.speaker)
+            gen = interface.generate_voice_clone_async(
+                text=request.text,
+                language=request.language,
+                voice_clone_prompt=voice_clone_prompt,
+            )
+        else:
+            gen = interface.generate_custom_voice_async(
+                text=request.text,
+                language=request.language,
+                speaker=request.speaker,
+            )
+
+        # --- FIRST CHUNK: get directly, decode inline, yield immediately ---
+        # No queue, no task scheduling -- code → decode → HTTP in one coroutine.
+        first_code = await gen.__anext__()
+        t_first_code = time.time()
+        pcm16_first, _ = _decode_inline([first_code])
+        t_first_decoded = time.time()
+        logger.info(
+            f"[stream] first code latency: {(t_first_code - start_time)*1000:.1f}ms "
+            f"decode: {(t_first_decoded - t_first_code)*1000:.1f}ms "
+            f"total: {(t_first_decoded - start_time)*1000:.1f}ms"
+        )
+        prev_len_24k = len(pcm16_first)
+        yield pcm16_first.tobytes()
+
+        # --- SUBSEQUENT CHUNKS: producer task + batched decode worker ---
+        codes_queue: asyncio.Queue[list | None] = asyncio.Queue()  # unbounded
+
+        async def producer() -> None:
+            audio_codes = [first_code]  # first code already yielded
+            last_chunk_time = t_first_code
+            try:
+                async for audio_code in gen:
+                    current_time = time.time()
+                    inner_latency = current_time - last_chunk_time
+                    logger.info(f"[producer] inner chunk latency: {inner_latency*1000:.2f}ms")
+                    last_chunk_time = current_time
+
+                    audio_codes.append(audio_code)
+                    if len(audio_codes) % 4 == 0:
+                        await codes_queue.put(list(audio_codes))
+                # final partial batch
+                if audio_codes and len(audio_codes) % 4 != 0:
+                    await codes_queue.put(list(audio_codes))
+            finally:
+                await codes_queue.put(None)  # sentinel
+
+        producer_task = asyncio.create_task(producer())
+
+        try:
+            while True:
+                item = await codes_queue.get()
+                if item is None:
+                    break
+                if _decode_queue is not None:
+                    pcm16, _ = await _decode_batched(item)
+                else:
+                    pcm16, _ = await loop.run_in_executor(
+                        None,
+                        lambda c=item: _decode_batch_sync(tokenizer, c),
+                    )
+                chunk = pcm16[prev_len_24k:].tobytes()
+                prev_len_24k = len(pcm16)
+                if chunk:
+                    yield chunk
+        finally:
+            await producer_task
+    except StopAsyncIteration:
+        # Generator produced no codes at all
+        pass
+    except Exception as e:
+        logger.error(f"[generate_speech_stream] Error: {e}")
+        import traceback
+        traceback.print_exc()
+        raise e
 
 @app.post("/v1/audio/speech", response_class=StreamingResponse)
 async def generate_speech(request: SpeechRequest):

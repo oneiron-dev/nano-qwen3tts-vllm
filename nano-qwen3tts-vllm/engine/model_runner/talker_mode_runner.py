@@ -105,7 +105,7 @@ class TalkerModeModelRunner(ModelRunner):
             last_indices = context.cu_seqlens_q[1:] - 1
             hidden_states = hidden_states[last_indices].contiguous()
         
-        logger.info(f"[talker mode model runner] Model run latency: {time.time() - start}")
+        logger.debug(f"[talker mode model runner] Model run latency: {time.time() - start}")
 
         return logits, hidden_states
 

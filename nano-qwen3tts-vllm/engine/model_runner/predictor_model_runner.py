@@ -81,7 +81,6 @@ class PredictorModelRunner(ModelRunner):
                 input_embeds = input_embeds.view(-1, input_embeds.size(-1))
                 
                 
-            logger.info(f"[predictor model runner] Input embeds shape: {input_embeds.shape}")
             num_tokens = input_embeds.size(0)
             context = get_context()
             num_seqs = context.cu_seqlens_q.size(0) - 1
@@ -118,10 +117,7 @@ class PredictorModelRunner(ModelRunner):
             # Use outputs from the graph; do NOT run self.model() again (that would double the work).
             hidden_states = graph_vars["outputs"][:bs]
             
-        logits = self.model.compute_logits(hidden_states, generation_steps)
-        
-        torch.cuda.synchronize()
-        logger.info(f"[predictor] model run latency: {time.time() - start}")
+        logits = self.model.compute_logits(hidden_states, generation_steps)        
         return logits
         
     
@@ -139,7 +135,10 @@ class PredictorModelRunner(ModelRunner):
         temperatures = self.prepare_sample(seqs) if self.rank == 0 else None
         
         try:
+            model_start = time.time()
             logits = self.run_model(positions, input_embeds, is_prefill, generation_steps)
+            model_latency = time.time() - model_start
+            logger.debug(f"[predictor model runner] Model run latency: {model_latency:.4f}s")
         except Exception as e:
             logger.error(f"[predictor model runner] Error running model: {e}")
             import traceback

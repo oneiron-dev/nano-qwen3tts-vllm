@@ -26,7 +26,6 @@ class Qwen3TTSTalkerResizeMLP(nn.Module):
         self.linear_fc2 = nn.Linear(intermediate_size, output_size, bias=bias)
         self.act_fn = torch.nn.functional.silu
 
-    @torch.compile
     def forward(self, hidden_state):
         return self.linear_fc2(self.act_fn(self.linear_fc1(hidden_state)))
 

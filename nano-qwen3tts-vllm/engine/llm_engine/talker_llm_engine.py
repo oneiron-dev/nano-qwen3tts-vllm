@@ -18,26 +18,12 @@ class TalkerScheduler(Scheduler):
         self.request_id_to_seq: dict[str, Sequence] = {}
 
     def schedule(self) -> tuple[list[Sequence], bool]:
-        # prefill: same as base
         scheduled_seqs = []
         num_seqs = 0
         num_batched_tokens = 0
-        while self.waiting and num_seqs < self.max_num_seqs:
-            seq = self.waiting[0]
-            if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
-                break
-            num_seqs += 1
-            self.block_manager.allocate(seq)
-            num_batched_tokens += len(seq) - seq.num_cached_tokens
-            seq.status = SequenceStatus.RUNNING
-            self.waiting.popleft()
-            self.running.append(seq)
-            scheduled_seqs.append(seq)
-        if scheduled_seqs:
-            logger.info(f"[talker scheduler] Scheduled {len(scheduled_seqs)} sequences for prefill")
-            return scheduled_seqs, True
 
-        # decode: only schedule seqs that have decode_input_embeds set (interface has fed next input)
+        # DECODE FIRST (priority) -- don't stall existing in-progress requests
+        # Only schedule seqs that have decode_input_embeds set (interface has fed next input)
         # Iterate at most once over running to avoid infinite loop when all seqs wait for decode input
         run_count = len(self.running)
         for _ in range(run_count):
@@ -58,11 +44,29 @@ class TalkerScheduler(Scheduler):
                 self.block_manager.may_append(seq)
                 scheduled_seqs.append(seq)
 
-        if not scheduled_seqs:
-            return [], False
-        self.running.extendleft(reversed(scheduled_seqs))
-        logger.info(f"[talker scheduler] Scheduled {len(scheduled_seqs)} sequences for decode")
-        return scheduled_seqs, False
+        if scheduled_seqs:
+            self.running.extendleft(reversed(scheduled_seqs))
+            logger.debug(f"[talker scheduler] Scheduled {len(scheduled_seqs)} sequences for decode")
+            return scheduled_seqs, False
+
+        # PREFILL only when no decode work is pending
+        while self.waiting and num_seqs < self.max_num_seqs:
+            seq = self.waiting[0]
+            if num_batched_tokens + len(seq) > self.max_num_batched_tokens or not self.block_manager.can_allocate(seq):
+                break
+            num_seqs += 1
+            self.block_manager.allocate(seq)
+            num_batched_tokens += len(seq) - seq.num_cached_tokens
+            seq.status = SequenceStatus.RUNNING
+            self.waiting.popleft()
+            self.running.append(seq)
+            scheduled_seqs.append(seq)
+
+        if scheduled_seqs:
+            logger.debug(f"[talker scheduler] Scheduled {len(scheduled_seqs)} sequences for prefill")
+            return scheduled_seqs, True
+
+        return [], False
 
     def clear_request(self, request_id: str):
         if request_id in self.request_id_to_seq:

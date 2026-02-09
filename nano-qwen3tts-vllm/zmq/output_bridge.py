@@ -273,9 +273,21 @@ class ZMQOutputBridge:
 
     def publish_token(self, engine_type: str, request_id: str, token_ids: list[int], hidden_states: Optional[Any] = None):
         """Publish a token output. engine_type is 'talker' or 'predictor'."""
+        import time as _time
+        t0 = _time.perf_counter()
         topic = topic_for(engine_type, request_id)
         payload = serialize_token_payload(token_ids, hidden_states)
+        t_ser = _time.perf_counter()
         self._socket.send_multipart([topic.encode("utf-8"), b"token", payload], flags=zmq.NOBLOCK)
+        t_send = _time.perf_counter()
+        if hidden_states is not None:
+            import logging
+            logging.getLogger(__name__).info(
+                f"[zmq_pub] {engine_type}/{request_id[:8]} "
+                f"serialize={(t_ser - t0)*1000:.2f}ms "
+                f"send={(t_send - t_ser)*1000:.2f}ms "
+                f"total={(t_send - t0)*1000:.2f}ms"
+            )
 
     def publish_done(self, engine_type: str, request_id: str, payload: Optional[bytes] = None):
         """Publish a done message for this request."""

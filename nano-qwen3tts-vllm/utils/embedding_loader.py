@@ -72,7 +72,7 @@ def load_embeddings_only(model_path: str, device: str = "cpu"):
     n_code = predictor_config.num_code_groups - 1
     predictor_codec = nn.ModuleList(
         [
-            nn.Embedding(predictor_config.vocab_size, predictor_config.hidden_size)
+            nn.Embedding(predictor_config.vocab_size, talker_config.hidden_size)
             for _ in range(n_code)
         ]
     )

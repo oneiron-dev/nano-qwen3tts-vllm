@@ -47,7 +47,9 @@ def _capture_decoder_cudagraphs(decoder, device: str, graph_lengths: List[int]):
 
     def forward_with_graph_replay(codes):
         T = codes.shape[2]
-        if T in decoder.graphs:
+        # CUDA graphs were captured with batch_size=1; fall back to eager
+        # for batched decode (when _decode_worker_loop groups multiple requests).
+        if T in decoder.graphs and codes.shape[0] == 1:
             decoder.graph_inputs[T].copy_(codes)
             decoder.graphs[T].replay()
             return decoder.graph_outputs[T]
