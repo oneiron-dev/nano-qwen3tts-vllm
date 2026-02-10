@@ -85,6 +85,7 @@ class Qwen3TTSTalkerForCausalLM(nn.Module):
         2. Skipping code_predictor and speaker_encoder keys (not part of talker model)
         3. MLP uses separate gate_proj, up_proj, down_proj (no fusion)
         4. Attention uses separate q_proj, k_proj, v_proj (no fusion)
+        5. Map embed_tokens -> codec_embedding when checkpoint uses embed_tokens (HF convention)
         """
         transformed = {}
 
@@ -104,6 +105,11 @@ class Qwen3TTSTalkerForCausalLM(nn.Module):
                 key_without_prefix = key
 
             transformed[key_without_prefix] = value
+
+        # Original talker forward() uses self.embed_tokens(input_ids); get_input_embeddings() returns codec_embedding.
+        # HF may save under embed_tokens. Prefer embed_tokens for codec_embedding so we match the original.
+        if "model.embed_tokens.weight" in transformed:
+            transformed["model.codec_embedding.weight"] = transformed["model.embed_tokens.weight"]
 
         return transformed
 

@@ -823,7 +823,6 @@ class Qwen3TTSInterface:
             generate_speaker_prompt_fn=generate_speaker_prompt_fn,
             generate_icl_prompt_fn=generate_icl_prompt_fn,
         )
-        
         # Generate and yield codebook_id chunks
         yield from self._generate_caller_driven(
             talker_input_embeds, trailing_text_hiddens, tts_pad_embed,
@@ -977,6 +976,7 @@ class Qwen3TTSInterface:
                 f"prepare_inputs={(_t5-_t4)*1000:.1f}ms "
                 f"total={(_t5-_t0)*1000:.1f}ms"
             )
+            talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask = result
             return result
         
         # Run prep directly on event loop – all ops are tiny GPU kernels on the

@@ -1,8 +1,12 @@
-"""Speech tokenizer with CUDA graph capture for fast decode (50 graphs T=1..50)."""
+"""Speech tokenizer with CUDA graph capture for fast decode (e.g. 64 graphs B=1..16 x T=1..4)."""
 import os
 import sys
 import torch
-from typing import Union, Tuple, List
+from typing import Union, Tuple, List, Generator, Any
+import logging
+import time
+
+logger = logging.getLogger(__name__)
 
 try:
     qwen_tts_path = os.path.expanduser(os.environ.get("QWEN_TTS_PATH", "/home/sang/work/Qwen3-TTS"))
@@ -15,54 +19,82 @@ except ImportError as e:
     _Qwen3TTSTokenizer = None
 
 
-def _capture_decoder_cudagraphs(decoder, device: str, graph_lengths: List[int]):
-    """Capture 50 CUDA graphs for decoder (one per length T=1..50). Patches decoder.forward in-place."""
+def _capture_decoder_cudagraphs(
+    decoder,
+    device: str,
+    graph_lengths: List[int],
+    batch_sizes: List[int] = None,
+):
+    """Capture CUDA graphs for decoder. Patches decoder.forward in-place.
+
+    If batch_sizes is None: legacy mode, one graph per T with batch=1 only (key = T).
+    If batch_sizes is set: key = (B, T) for B in batch_sizes, T in graph_lengths (e.g. 16*4=64 graphs).
+    """
     decoder.eval()
+    if batch_sizes is None:
+        batch_sizes = [1]
     # Warmup
     with torch.inference_mode():
-        _ = decoder(torch.randint(0, 100, (1, 16, 100), device=device))
+        _ = decoder(torch.randint(0, 100, (max(batch_sizes), 16, max(graph_lengths)), device=device))
         torch.cuda.synchronize()
 
     decoder.graphs = {}
     decoder.graph_inputs = {}
     decoder.graph_outputs = {}
+    decoder._graph_key_is_tuple = len(batch_sizes) > 1 or max(batch_sizes) > 1
     graph_pool = None
 
+    # Capture in reverse order (larger shapes first) for pool reuse
     with torch.inference_mode():
-        for T in reversed(graph_lengths):
-            graph = torch.cuda.CUDAGraph()
-            input_buf = torch.randint(0, 100, (1, 16, T), device=device, dtype=torch.long)
-            _ = decoder(input_buf)
-            torch.cuda.synchronize()
-            with torch.cuda.graph(graph, graph_pool):
-                output_buf = decoder(input_buf)
-            if graph_pool is None:
-                graph_pool = graph.pool()
-            decoder.graphs[T] = graph
-            decoder.graph_inputs[T] = input_buf
-            decoder.graph_outputs[T] = output_buf
-            torch.cuda.synchronize()
+        for B in reversed(batch_sizes):
+            for T in reversed(graph_lengths):
+                graph = torch.cuda.CUDAGraph()
+                input_buf = torch.randint(0, 100, (B, 16, T), device=device, dtype=torch.long)
+                _ = decoder(input_buf)
+                torch.cuda.synchronize()
+                with torch.cuda.graph(graph, graph_pool):
+                    output_buf = decoder(input_buf)
+                if graph_pool is None:
+                    graph_pool = graph.pool()
+                key = (B, T) if decoder._graph_key_is_tuple else T
+                decoder.graphs[key] = graph
+                decoder.graph_inputs[key] = input_buf
+                decoder.graph_outputs[key] = output_buf
+                torch.cuda.synchronize()
 
     decoder.original_forward = decoder.forward
-
     def forward_with_graph_replay(codes):
-        T = codes.shape[2]
-        # CUDA graphs were captured with batch_size=1; fall back to eager
-        # for batched decode (when _decode_worker_loop groups multiple requests).
-        if T in decoder.graphs and codes.shape[0] == 1:
-            decoder.graph_inputs[T].copy_(codes)
-            decoder.graphs[T].replay()
-            return decoder.graph_outputs[T]
+        import time
+        B, T = codes.shape[0], codes.shape[2]
+        if decoder._graph_key_is_tuple:
+            key = (B, T) if (B, T) in decoder.graphs else None
+        else:
+            key = T if T in decoder.graphs and B == 1 else None
+        if key is not None:
+            start_time = time.time()
+            decoder.graph_inputs[key].copy_(codes)
+            decoder.graphs[key].replay()
+            # Note: no torch.cuda.synchronize() here, so this is launch-only. The real wait
+            # happens later at .cpu().numpy() in decode_window, which syncs + transfers GPU→CPU.
+            # So "decoder latency" in the server includes executor + decode_window (+ .cpu()) + resample.
+            elapsed_ms = (time.time() - start_time) * 1000
+            if elapsed_ms > 1.0:  # only log when non-trivial
+                logger.info(f"graph replay (launch) key={key} {elapsed_ms:.2f}ms")
+            return decoder.graph_outputs[key]
+    
+        logger.info(f"using original forward for key: {key}")
         return decoder.original_forward(codes)
 
     decoder.forward = forward_with_graph_replay
 
 
 class SpeechTokenizerCUDAGraph:
-    """Qwen3-TTS speech tokenizer with 50 captured CUDA graphs for fast decode.
+    """Qwen3-TTS speech tokenizer with CUDA graph capture for fast decode.
 
-    Loads the 12Hz tokenizer, captures one graph per decode length T=1..50,
-    and patches the decoder to replay graphs when shape matches (like predictor_model_runner).
+    Can capture either:
+    - Legacy: one graph per seq length T=1..num_graph_lengths, batch=1 only.
+    - Multi-batch (streaming window): graphs for B=1..graph_batch_sizes and T=1..graph_seq_lengths
+      (e.g. 16 x 4 = 64 graphs) so decode_window with small context always hits a graph.
     """
 
     def __init__(
@@ -70,15 +102,19 @@ class SpeechTokenizerCUDAGraph:
         model_path: str,
         device: str = None,
         dtype: torch.dtype = torch.bfloat16,
-        num_graph_lengths: int = 1,
+        num_graph_lengths: int = 0,
+        graph_batch_sizes: int = 0,
+        graph_seq_lengths: int = 0,
     ):
         """Load tokenizer and capture CUDA graphs for decoder.
 
         Args:
-            model_path: Path to model dir; speech tokenizer loaded from {model_path}/speech_tokenizer.
+            model_path: Path to model dir or HuggingFace id.
             device: Device for model (default: cuda:0 if available).
             dtype: Model dtype (default: bfloat16).
-            num_graph_lengths: Number of graphs to capture for lengths 1..num_graph_lengths (default: 50).
+            num_graph_lengths: Legacy: capture T=1..num_graph_lengths with batch=1 only (0 = skip).
+            graph_batch_sizes: If >0, capture (B, T) for B=1..graph_batch_sizes, T=1..graph_seq_lengths (64 graphs for 16x4).
+            graph_seq_lengths: Max seq length for multi-batch graphs (e.g. 4 for streaming window).
         """
         if not HAS_SPEECH_TOKENIZER:
             raise ImportError(
@@ -104,13 +140,28 @@ class SpeechTokenizerCUDAGraph:
         self.device = device
         self.dtype = dtype
 
-        if device.startswith("cuda") and num_graph_lengths > 0:
-            graph_lengths = list(range(1, num_graph_lengths + 1))
-            print(f"Capturing {len(graph_lengths)} CUDA graphs for decoder (T=1..{num_graph_lengths})...")
-            _capture_decoder_cudagraphs(self.tokenizer.model.decoder, device, graph_lengths)
-            print("CUDA graph capture done.")
+        if device.startswith("cuda"):
+            if graph_batch_sizes > 0 and graph_seq_lengths > 0:
+                batch_sizes = list(range(1, graph_batch_sizes + 1))
+                seq_lengths = list(range(1, graph_seq_lengths + 1))
+                n = len(batch_sizes) * len(seq_lengths)
+                print(f"Capturing {n} CUDA graphs for decoder (B=1..{graph_batch_sizes} x T=1..{graph_seq_lengths})...")
+                _capture_decoder_cudagraphs(
+                    self.tokenizer.model.decoder,
+                    device,
+                    seq_lengths,
+                    batch_sizes=batch_sizes,
+                )
+                print("CUDA graph capture done.")
+            elif num_graph_lengths > 0:
+                graph_lengths = list(range(1, num_graph_lengths + 1))
+                print(f"Capturing {len(graph_lengths)} CUDA graphs for decoder (T=1..{num_graph_lengths}, B=1)...")
+                _capture_decoder_cudagraphs(self.tokenizer.model.decoder, device, graph_lengths)
+                print("CUDA graph capture done.")
+            else:
+                print("Skipping CUDA graph capture (no graph_batch_sizes/graph_seq_lengths or num_graph_lengths).")
         else:
-            print("Skipping CUDA graph capture (CPU or num_graph_lengths=0).")
+            print("Skipping CUDA graph capture (CPU).")
 
         print(f"Speech tokenizer (CUDAGraph) loaded: sample_rate={self.sample_rate}Hz, device={self.device}")
 
@@ -157,6 +208,103 @@ class SpeechTokenizerCUDAGraph:
         wavs = [wav.squeeze().to(torch.float32).cpu().numpy()]
         sr = int(self.tokenizer.model.get_output_sample_rate())
         return wavs, sr
+
+    @torch.inference_mode()
+    def decode_window(
+        self,
+        inputs: List[dict],
+        left_context_frames: int = 0,
+    ) -> Tuple[List, int]:
+        """Decode audio_codes and return only the audio after the first left_context_frames.
+
+        Used for streaming: decode a window [context + new], trim to get only the "new" part.
+
+        Args:
+            inputs: List of dicts with key 'audio_codes' (tensor [time, 16] or list).
+            left_context_frames: Number of leading code frames to drop from decoded audio (0 = return full).
+
+        Returns:
+            (wavs, sample_rate). wavs[0] is float32 numpy 1D.
+        """
+        audio_codes = inputs[0]["audio_codes"]
+        if isinstance(audio_codes, list):
+            codes = torch.tensor(audio_codes, dtype=torch.long, device=self.device)
+        else:
+            codes = audio_codes.to(self.device)
+        if codes.dim() == 2:
+            codes = codes.transpose(0, 1).unsqueeze(0)  # [1, 16, T]
+
+        decoder_model = self.tokenizer.model.decoder
+        samples_per_frame = int(decoder_model.total_upsample)
+        sr = int(self.tokenizer.model.get_output_sample_rate())
+
+        t0 = time.perf_counter()
+        wav = decoder_model(codes)  # [1, 1, samples]
+        torch.cuda.synchronize()
+        gpu_sync_ms = (time.perf_counter() - t0) * 1000
+
+        keep_start = left_context_frames * samples_per_frame
+        wav_new = wav[..., keep_start:].squeeze(0).squeeze(0).to(torch.float32).cpu().numpy()
+        cpu_transfer_ms = (time.perf_counter() - t0) * 1000 - gpu_sync_ms
+        total_ms = (time.perf_counter() - t0) * 1000
+
+        logger.info(
+            f"decode_window: gpu+sync={gpu_sync_ms:.2f}ms cpu_transfer={cpu_transfer_ms:.2f}ms total={total_ms:.2f}ms "
+            f"(executor_ms - total ≈ thread-pool wait)"
+        )
+        return [wav_new], sr
+
+    @torch.inference_mode()
+    def streaming_decode(
+        self,
+        inputs: List[dict],
+        chunk_size: int,
+        context_size: int,
+    ) -> Generator[Tuple[Any, int], None, None]:
+        """Decode audio_codes in streaming chunks with left context for continuity.
+
+        First chunk: decode codes[0:chunk_size] → output chunk_size frames of audio.
+        Later chunks: decode codes[start-context_size:start+chunk_size], then trim to
+        keep only the last chunk_size frames of audio (the "new" part).
+
+        Args:
+            inputs: List of dicts with key 'audio_codes' (tensor [time, 16] or list of length-T).
+            chunk_size: Max number of code frames to decode per chunk (and to output per yield).
+            context_size: Number of previous code frames to prepend when decoding (except first chunk).
+
+        Yields:
+            (wav_chunk, sample_rate) per chunk. wav_chunk is float32 numpy 1D or tensor.
+        """
+        audio_codes = inputs[0]["audio_codes"]
+        if isinstance(audio_codes, list):
+            codes = torch.tensor(audio_codes, dtype=torch.long, device=self.device)
+        else:
+            codes = audio_codes.to(self.device)
+        if codes.dim() == 2:
+            codes = codes.transpose(0, 1).unsqueeze(0)  # [1, 16, T]
+
+        decoder_model = self.tokenizer.model.decoder
+        samples_per_frame = int(decoder_model.total_upsample)
+        sr = int(self.tokenizer.model.get_output_sample_rate())
+        T = codes.shape[2]
+
+        start = 0
+        while start < T:
+            end = min(start + chunk_size, T)
+            if start == 0:
+                context_frames = 0
+                window = codes[:, :, 0:end]
+            else:
+                left = max(0, start - context_size)
+                context_frames = start - left
+                window = codes[:, :, left:end]
+
+            wav_chunk = decoder_model(window)
+            keep_start = context_frames * samples_per_frame
+            wav_new = wav_chunk[..., keep_start:].squeeze(0).squeeze(0)
+            wav_np = wav_new.to(torch.float32).cpu().numpy()
+            yield wav_np, sr
+            start = end
 
     @torch.inference_mode()
     def decode_codec_ids(self, codec_ids: torch.Tensor) -> Tuple[List, int]:

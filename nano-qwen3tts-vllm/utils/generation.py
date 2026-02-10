@@ -156,7 +156,7 @@ def prepare_inputs(
                         ]
                     ],
                     device=device,
-                    dtype=input_id.dtype,
+                    dtype=torch.long,
                 )
             )
         ).chunk(3, dim=1)
@@ -184,9 +184,10 @@ def prepare_inputs(
             torch.tensor(
                 codec_prefill_list,
                 device=device,
-                dtype=input_id.dtype,
+                dtype=torch.long,
             )
         )
+        # Match original Qwen3TTS (modeling_qwen3_tts.py): order [codec_pad_id, codec_bos_id], pos7 = tts_bos + codec_pad.
         codec_input_embedding_1 = input_embedding(
             torch.tensor(
                 [
@@ -196,7 +197,7 @@ def prepare_inputs(
                     ]
                 ],
                 device=device,
-                dtype=input_id.dtype,
+                dtype=torch.long,
             )
         )
 
@@ -453,7 +454,9 @@ def generate_icl_prompt(
     
     num_code_groups = config.talker_config.num_code_groups
     
-    # Text embed (ref id + text id + eos) [1, T1, D]
+    # Text embed (ref id + text id + eos) [1, T1, D]. Use long for embedding indices.
+    ref_id = ref_id.long() if ref_id.dtype != torch.long else ref_id
+    text_id = text_id.long() if text_id.dtype != torch.long else text_id
     text_embed = text_projection(
         text_embedding(torch.cat([ref_id, text_id], dim=-1))
     )
@@ -496,12 +499,12 @@ def generate_icl_prompt(
     codec_lens = codec_embed.shape[1]
     
     if non_streaming_mode:
-        # Add codec_pad_id to text_embed
+        # Add codec_pad_id to text_embed (embedding expects long indices)
         icl_input_embed = text_embed + input_embedding(
             torch.tensor(
                 [[config.talker_config.codec_pad_id] * text_lens],
                 device=device,
-                dtype=text_id.dtype,
+                dtype=torch.long,
             )
         )
         # Concatenate with codec_embed + tts_pad_embed
