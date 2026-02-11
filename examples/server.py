@@ -7,11 +7,12 @@ Env:
 """
 
 import asyncio
+from collections import deque
 import logging
 import os
 import time
-import threading
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, suppress
+from typing import Optional
 import numpy as np
 import torch
 from fastapi import FastAPI, HTTPException
@@ -34,7 +35,6 @@ if not logging.getLogger().handlers:
 _interface = None
 _tokenizer = None
 _zmq_bridge = None
-_decode_lock = threading.Lock()
 
 
 def _use_zmq():
@@ -104,6 +104,7 @@ def get_tokenizer():
         _tokenizer = SpeechTokenizerCUDAGraph(
             "Qwen/Qwen3-TTS-Tokenizer-12Hz",
             device="cuda:0",
+            streaming_window_size=80,
         )
         
     return _tokenizer
@@ -113,11 +114,12 @@ def get_tokenizer():
 async def lifespan(app: FastAPI):
     """Startup: warm up model and start ZMQ tasks when USE_ZMQ. Shutdown: stop ZMQ tasks and close bridge."""
     interface = get_interface()
-    get_tokenizer()
+    tokenizer = get_tokenizer()
+    dummy_codes = torch.zeros((80, 16), dtype=torch.long)
+    tokenizer.decode_streaming(dummy_codes, pad_to_size=80)
     if _use_zmq() and interface.zmq_bridge is not None:
         await interface.start_zmq_tasks()
-        
-    generate_speech_stream(SpeechRequest(text="Hello, this is a test.", language="English", speaker="Vivian"))
+
     yield
     if _use_zmq() and _interface is not None and _interface.zmq_bridge is not None:
         await _interface.stop_zmq_tasks()
@@ -165,28 +167,59 @@ def _resample_to_24k(wav: np.ndarray, orig_sr: int) -> np.ndarray:
     return np.interp(indices, np.arange(n_orig), wav).astype(np.float32)
 
 
-def _decode_batch(tokenizer, audio_codes: list) -> tuple[np.ndarray, int]:
-    """Decode cumulative audio_codes to PCM16 @ 24kHz. Returns (pcm16, sample_rate)."""
-    with _decode_lock:
-        wav_list, sr = tokenizer.decode([{"audio_codes": audio_codes}])
-    wav = wav_list[0]
-    wav_24k = _resample_to_24k(wav, sr)
-    return _float_to_pcm16(wav_24k), TARGET_SAMPLE_RATE
+def _crossfade(prev_tail: np.ndarray, new_head: np.ndarray) -> np.ndarray:
+    """Linear crossfade between end of previous chunk and start of new chunk."""
+    n = min(len(prev_tail), len(new_head))
+    if n <= 0:
+        return new_head
+    w = np.linspace(0.0, 1.0, n, dtype=np.float32)
+    return prev_tail[:n] * (1.0 - w) + new_head[:n] * w
 
 
-async def generate_speech_stream(request: SpeechRequest):
-    """
-    Streaming decode: producer (generation) and consumer (decode) run concurrently.
-    Uses single asyncio.Queue + run_in_executor — no decode thread, no call_soon_threadsafe.
-    When consumer awaits decode in executor, event loop runs producer (overlap).
-    """
+def _add_ref_code_context(
+    window_codes: torch.Tensor,
+    ref_code_context: Optional[torch.Tensor],
+    ref_code_frames: int,
+    decode_window_frames: int,
+) -> tuple[torch.Tensor, int]:
+    """Prepend ref_code as decoder context prefix when window is smaller than decode_window_frames."""
+    if ref_code_context is None or window_codes.shape[0] >= decode_window_frames:
+        return window_codes, 0
+
+    available_space = decode_window_frames - window_codes.shape[0]
+    ref_prefix_frames = min(available_space, ref_code_frames)
+    if ref_prefix_frames <= 0:
+        return window_codes, 0
+
+    if not torch.is_tensor(ref_code_context):
+        ref_code_context = torch.as_tensor(ref_code_context, dtype=window_codes.dtype)
+    ref_prefix = ref_code_context[-ref_prefix_frames:].to(window_codes.dtype)
+    return torch.cat([ref_prefix, window_codes], dim=0), ref_prefix_frames
+
+
+async def generate_speech_stream(
+    request: SpeechRequest,
+    emit_every_frames: int = 4,
+    decode_window_frames: int = 80,
+    overlap_samples: int = 0,
+    ref_code_context=None,
+    ref_code_frames: int = 0,
+):
+    """Streaming decode with sliding window and optional crossfade."""
     interface = get_interface()
     tokenizer = get_tokenizer()
     loop = asyncio.get_event_loop()
-    codes_queue: asyncio.Queue[list | None] = asyncio.Queue(maxsize=2)  # backpressure
+    samples_per_frame = tokenizer.get_decode_upsample_rate()
+    request_start_ts = time.perf_counter()
+    first_chunk_emitted = False
+
+    codes_queue: asyncio.Queue[tuple | None] = asyncio.Queue(maxsize=2)
+
     async def producer() -> None:
-        audio_codes = []
-        first_chunk_time = None
+        window_codes = deque(maxlen=decode_window_frames)
+        total_frames = 0
+        last_emitted_frame_index = 0
+        frames_since_emit = 0
         last_chunk_time = None
         try:
             async for audio_code in interface.generate_custom_voice_async(
@@ -194,47 +227,96 @@ async def generate_speech_stream(request: SpeechRequest):
                 language=request.language,
                 speaker=request.speaker,
             ):
-                current_time = time.time()
-                if first_chunk_time is None:
-                    first_chunk_time = current_time
+                current_time = time.perf_counter()
                 if last_chunk_time is not None:
                     inner_latency = current_time - last_chunk_time
-                    print(f"[producer] inner chunk latency: {inner_latency*1000:.2f}ms")
+                    logger.debug("[producer] inner chunk latency: %.2fms", inner_latency * 1000.0)
                 last_chunk_time = current_time
-                
-                audio_codes.append(audio_code)
-                if len(audio_codes) % 4 == 0:  # decode every 4 chunks
-                    await codes_queue.put(list(audio_codes))
-            
-            if first_chunk_time is not None:
-                first_chunk_latency = last_chunk_time - first_chunk_time
-                print(f"[producer] first chunk latency: {first_chunk_latency*1000:.2f}ms")
-            
-            # final batch if not already sent (e.g. 13 chunks: sent at 12, need 13)
-            if audio_codes and len(audio_codes) % 4 != 0:
-                await codes_queue.put(list(audio_codes))
+
+                frame = torch.as_tensor(audio_code, dtype=torch.long).cpu()
+                window_codes.append(frame)
+                total_frames += 1
+                frames_since_emit += 1
+
+                if frames_since_emit >= emit_every_frames:
+                    n_new_frames = total_frames - last_emitted_frame_index
+                    await codes_queue.put(("chunk", list(window_codes), n_new_frames, 0))
+                    last_emitted_frame_index = total_frames
+                    frames_since_emit = 0
+
+            unemitted_frames = total_frames - last_emitted_frame_index
+            if unemitted_frames > 0:
+                window_snapshot = list(window_codes)
+                skip_frames = len(window_snapshot) - unemitted_frames
+                await codes_queue.put(("flush", window_snapshot, unemitted_frames, skip_frames))
         finally:
-            await codes_queue.put(None)  # sentinel
+            try:
+                await codes_queue.put(None)
+            except asyncio.CancelledError:
+                with suppress(asyncio.QueueFull):
+                    codes_queue.put_nowait(None)
+                raise
 
     producer_task = asyncio.create_task(producer())
-    prev_len_24k = 0
+    decoded_tail = None
 
     try:
         while True:
             item = await codes_queue.get()
             if item is None:
                 break
-            # run_in_executor: decode in thread pool; event loop runs producer meanwhile
-            pcm16, _ = await loop.run_in_executor(
-                None,
-                lambda c=item: _decode_batch(tokenizer, c),
+
+            msg_type, window_codes_list, n_new_frames, skip_frames = item
+            if not window_codes_list or n_new_frames <= 0:
+                continue
+            window_tensor = torch.stack(window_codes_list, dim=0)  # [T, 16]
+            window_tensor, ref_prefix_used = _add_ref_code_context(
+                window_tensor, ref_code_context, ref_code_frames, decode_window_frames
             )
-            chunk = pcm16[prev_len_24k:].tobytes()
-            prev_len_24k = len(pcm16)
-            if chunk:
-                yield chunk
+
+            wav, sr = await loop.run_in_executor(
+                None,
+                lambda w=window_tensor: tokenizer.decode_streaming(
+                    w, pad_to_size=decode_window_frames
+                ),
+            )
+
+            if msg_type == "chunk":
+                new_samples = int(n_new_frames * samples_per_frame)
+                chunk = wav[-new_samples:] if new_samples > 0 else np.empty(0, dtype=np.float32)
+            else:
+                skip_samples = int((skip_frames + ref_prefix_used) * samples_per_frame)
+                chunk = wav[skip_samples:] if skip_samples > 0 else wav
+
+            if decoded_tail is not None and overlap_samples > 0 and len(chunk) > 0:
+                ov = min(overlap_samples, len(decoded_tail), len(chunk))
+                if ov > 0:
+                    head = _crossfade(decoded_tail[-ov:], chunk[:ov])
+                    chunk = np.concatenate([head, chunk[ov:]], axis=0)
+
+            if overlap_samples > 0 and len(chunk) > 0:
+                decoded_tail = chunk[-overlap_samples:].copy()
+            else:
+                decoded_tail = None
+
+            chunk_24k = _resample_to_24k(chunk, sr)
+            pcm16 = _float_to_pcm16(chunk_24k)
+            if len(pcm16) > 0:
+                if not first_chunk_emitted:
+                    ttfb_ms = (time.perf_counter() - request_start_ts) * 1000.0
+                    logger.debug("[consumer] first chunk latency (TTFB): %.2fms", ttfb_ms)
+                    first_chunk_emitted = True
+                yield pcm16.tobytes()
+    except asyncio.CancelledError:
+        producer_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await producer_task
+        raise
     finally:
-        await producer_task
+        if not producer_task.done():
+            producer_task.cancel()
+        with suppress(asyncio.CancelledError):
+            await producer_task
 
 
 @app.post("/v1/audio/speech", response_class=StreamingResponse)
