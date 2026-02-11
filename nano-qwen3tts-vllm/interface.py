@@ -523,7 +523,8 @@ class Qwen3TTSInterface:
         try:
             spk_emb = self.extract_speaker_embedding(audio=wav_resample, sr=24000)
         except RuntimeError as e:
-            if "speaker_encoder" not in str(e):
+            msg = str(e).lower()
+            if "speaker_encoder" not in msg and "speaker encoder" not in msg:
                 raise
             hidden_size = int(self.input_embedding.weight.shape[-1])
             emb_dtype = self.input_embedding.weight.dtype
