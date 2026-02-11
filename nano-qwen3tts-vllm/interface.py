@@ -518,9 +518,17 @@ class Qwen3TTSInterface:
                 target_sr=24000
             )
         
-        # Extract speaker embedding
-        spk_emb = self.extract_speaker_embedding(audio=wav_resample, sr=24000)
-        
+        # Extract speaker embedding. VoiceDesign checkpoints can omit speaker_encoder;
+        # fallback to a zero embedding so ICL/ref-code cloning can still run.
+        try:
+            spk_emb = self.extract_speaker_embedding(audio=wav_resample, sr=24000)
+        except RuntimeError as e:
+            if "speaker_encoder" not in str(e):
+                raise
+            hidden_size = int(self.input_embedding.weight.shape[-1])
+            emb_dtype = self.input_embedding.weight.dtype
+            spk_emb = torch.zeros(hidden_size, dtype=emb_dtype, device=self.device)
+
         return {
             "ref_code": None if x_vector_only_mode else ref_code,
             "ref_spk_embedding": spk_emb,
