@@ -462,6 +462,19 @@ class Qwen3TTSInterface:
         # Decode using speech tokenizer
         wavs, sr = self.speech_tokenizer.decode(codebook_tensor)
         return wavs, sr
+
+    def decode_codes_to_audio(
+        self, codes_list: List[List[int]]
+    ) -> Tuple[List[np.ndarray], int]:
+        """Public helper for decoding raw codebook IDs to audio.
+
+        Args:
+            codes_list: List of [16] codebook IDs per frame.
+
+        Returns:
+            Tuple of (wavs, sr).
+        """
+        return self._codebook_ids_to_audio(codes_list)
     
     def create_voice_clone_prompt(
         self,
@@ -791,6 +804,111 @@ class Qwen3TTSInterface:
                     non_streaming_mode=True,
                     text_embedding=self.text_embedding, input_embedding=self.input_embedding,
                     text_projection=self.text_projection, device=self.device,
+                )
+
+        loop = asyncio.get_event_loop()
+        talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask = await loop.run_in_executor(
+            None, _prep_in_thread
+        )
+        async for chunk in self.generate_async(
+            talker_input_embeds, trailing_text_hiddens, tts_pad_embed, talker_attention_mask
+        ):
+            yield chunk
+
+    async def generate_voice_clone_async(
+        self,
+        text: str,
+        language: str = None,
+        ref_text: Optional[str] = None,
+        voice_clone_prompt: Optional[Dict[str, Any]] = None,
+        non_streaming_mode: bool = True,
+    ):
+        """Async generator of voice-clone codebook chunks.
+
+        Requires zmq_bridge; call await start_zmq_tasks() first.
+        """
+        if self.zmq_bridge is None:
+            raise RuntimeError("generate_voice_clone_async requires zmq_bridge")
+        if voice_clone_prompt is None:
+            raise ValueError("voice_clone_prompt is required for generate_voice_clone_async")
+
+        if language is None:
+            language = "Auto"
+
+        icl_mode_enabled = bool(voice_clone_prompt.get("icl_mode", False))
+        prompt_ref_text = voice_clone_prompt.get("ref_text")
+        if icl_mode_enabled:
+            if ref_text is not None:
+                ref_text_for_ids = ref_text
+            elif prompt_ref_text is not None:
+                ref_text_for_ids = prompt_ref_text
+            else:
+                raise ValueError(
+                    "ICL mode is enabled in voice_clone_prompt but ref_text is not available."
+                )
+        else:
+            ref_text_for_ids = None
+
+        def _prep_in_thread() -> tuple:
+            with self._prep_lock:
+                input_text = f"<|im_start|>assistant\n{text}<|im_end|>\n<|im_start|>assistant\n"
+                input_ids = _tokenize_texts([input_text], self.processor, self.device)
+
+                ref_ids = None
+                if ref_text_for_ids is not None and ref_text_for_ids != "":
+                    ref_tok = _tokenize_texts(
+                        [self._build_ref_text(ref_text_for_ids)],
+                        self.processor,
+                        self.device,
+                    )[0]
+                    ref_ids = [ref_tok]
+
+                voice_clone_prompt_lists = {
+                    "ref_code": [voice_clone_prompt["ref_code"]],
+                    "ref_spk_embedding": [voice_clone_prompt["ref_spk_embedding"]],
+                    "x_vector_only_mode": [bool(voice_clone_prompt["x_vector_only_mode"])],
+                    "icl_mode": [bool(voice_clone_prompt["icl_mode"])],
+                }
+
+                def generate_speaker_prompt_fn(prompt):
+                    return generate_speaker_prompt(prompt, self.device)
+
+                def generate_icl_prompt_fn(
+                    text_id,
+                    ref_id,
+                    ref_code,
+                    tts_pad_embed,
+                    tts_eos_embed,
+                    non_streaming_mode,
+                ):
+                    return generate_icl_prompt(
+                        text_id=text_id,
+                        ref_id=ref_id,
+                        ref_code=ref_code,
+                        tts_pad_embed=tts_pad_embed,
+                        tts_eos_embed=tts_eos_embed,
+                        non_streaming_mode=non_streaming_mode,
+                        config=self.model_config,
+                        text_embedding=self.text_embedding,
+                        input_embedding=self.input_embedding,
+                        text_projection=self.text_projection,
+                        code_predictor_embeddings=self.predictor_input_embeddings,
+                        device=self.device,
+                    )
+
+                return prepare_inputs(
+                    config=self.model_config,
+                    input_ids=input_ids,
+                    ref_ids=ref_ids,
+                    voice_clone_prompt=voice_clone_prompt_lists,
+                    languages=[language],
+                    non_streaming_mode=non_streaming_mode,
+                    text_embedding=self.text_embedding,
+                    input_embedding=self.input_embedding,
+                    text_projection=self.text_projection,
+                    device=self.device,
+                    generate_speaker_prompt_fn=generate_speaker_prompt_fn,
+                    generate_icl_prompt_fn=generate_icl_prompt_fn,
                 )
 
         loop = asyncio.get_event_loop()
