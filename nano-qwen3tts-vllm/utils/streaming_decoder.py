@@ -83,7 +83,14 @@ class StaticStreamingKVCache:
         self._seq_len = torch.zeros(1, dtype=torch.long, device=device)
 
     def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
-        N = key_states.shape[2]
+        B, H, N, D = key_states.shape
+        cache_B, cache_H, cache_S, cache_D = self.key_cache[layer_idx].shape
+        if H != cache_H or D != cache_D:
+            raise ValueError(
+                f"StaticStreamingKVCache shape mismatch at layer {layer_idx}: "
+                f"cache=[{cache_B},{cache_H},{cache_S},{cache_D}] "
+                f"key_states=[{B},{H},{N},{D}]"
+            )
         # Tensor-only indexing for CUDA graph compatibility (no .item())
         indices = torch.arange(N, device=key_states.device) + self._seq_len.squeeze()
         self.key_cache[layer_idx].index_copy_(2, indices, key_states)
@@ -473,15 +480,25 @@ def init_cudagraph_streaming_state(
 
     _add_conv("dec.final", decoder.decoder[-1])
 
-    # Static KV cache
+    # Static KV cache — derive shapes from actual projection weights
+    # to avoid config mismatches (num_attention_heads vs num_key_value_heads)
     transformer = decoder.pre_transformer
     config = transformer.config
+    first_layer = transformer.layers[0]
+    # k_proj weight shape: [num_kv_heads * head_dim, hidden_size]
+    kv_proj_shape = first_layer.self_attn.k_proj.weight.shape
+    num_kv_heads = config.num_key_value_heads
+    head_dim = kv_proj_shape[0] // num_kv_heads
+    logger.info(
+        "[streaming] KV cache: num_layers=%d, num_kv_heads=%d, head_dim=%d, max_seq_len=%d",
+        config.num_hidden_layers, num_kv_heads, head_dim, max_seq_len,
+    )
     state.kv_cache = StaticStreamingKVCache(
         num_layers=config.num_hidden_layers,
         batch_size=B,
-        num_heads=config.num_key_value_heads,
+        num_heads=num_kv_heads,
         max_seq_len=max_seq_len,
-        head_dim=config.hidden_size // config.num_attention_heads,
+        head_dim=head_dim,
         device=device,
         dtype=dtype,
     )
@@ -591,10 +608,13 @@ def get_compiled_decoder():
     """Lazily compile the decode function with torch.compile."""
     global _compiled_decoder
     if _compiled_decoder is None:
-        logger.info("[streaming] compiling decode_incremental with torch.compile(mode='reduce-overhead')")
+        # Use "max-autotune" not "reduce-overhead" — the latter captures
+        # internal CUDA graphs that conflict with mutable conv cache state
+        # passed between calls (cache tensors are both graph inputs & outputs)
+        logger.info("[streaming] compiling decode_incremental with torch.compile(mode='max-autotune')")
         _compiled_decoder = torch.compile(
             _decode_incremental_inner,
-            mode="reduce-overhead",
+            mode="max-autotune",
             fullgraph=False,   # Allow graph breaks at DynamicCache
             dynamic=False,     # N is always 1 or 4
         )
