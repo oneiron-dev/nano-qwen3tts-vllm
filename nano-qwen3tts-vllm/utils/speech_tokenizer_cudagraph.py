@@ -2,9 +2,16 @@
 import os
 import sys
 import torch
+import numpy as np
 from typing import Union, Tuple, List, Generator, Any
 import logging
 import time
+
+from .streaming_decoder import (
+    StreamingDecoderState,
+    init_streaming_state,
+    decode_incremental as _decode_incremental,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -305,6 +312,50 @@ class SpeechTokenizerCUDAGraph:
             wav_np = wav_new.to(torch.float32).cpu().numpy()
             yield wav_np, sr
             start = end
+
+    def init_streaming(self) -> StreamingDecoderState:
+        """Initialize streaming state for a new synthesis request.
+
+        Call this once per utterance, then pass the returned state to
+        decode_incremental() for each chunk of new codec frames.
+        """
+        return init_streaming_state()
+
+    @torch.inference_mode()
+    def decode_incremental(
+        self,
+        new_codes: torch.Tensor,
+        state: StreamingDecoderState,
+    ) -> Tuple[np.ndarray, int, StreamingDecoderState]:
+        """Decode only new frames using cached streaming state.
+
+        ~20x less compute than decode_window() for typical streaming
+        (4 new frames vs 80-frame window re-decode).
+
+        Args:
+            new_codes: [B, 16, N] new codec frames.
+            state: StreamingDecoderState from init_streaming() or previous call.
+
+        Returns:
+            (wav_new, sample_rate, state).
+            wav_new is a float32 numpy 1D array of new audio samples.
+        """
+        decoder = self.tokenizer.model.decoder
+        sr = int(self.tokenizer.model.get_output_sample_rate())
+
+        t0 = time.perf_counter()
+        wav = _decode_incremental(decoder, new_codes, state)
+        torch.cuda.synchronize()
+        gpu_ms = (time.perf_counter() - t0) * 1000
+
+        wav_np = wav.squeeze(0).squeeze(0).to(torch.float32).cpu().numpy()
+        total_ms = (time.perf_counter() - t0) * 1000
+
+        logger.info(
+            f"decode_incremental: gpu+sync={gpu_ms:.2f}ms total={total_ms:.2f}ms "
+            f"frames={new_codes.shape[2]} samples={len(wav_np)}"
+        )
+        return wav_np, sr, state
 
     @torch.inference_mode()
     def decode_codec_ids(self, codec_ids: torch.Tensor) -> Tuple[List, int]:
