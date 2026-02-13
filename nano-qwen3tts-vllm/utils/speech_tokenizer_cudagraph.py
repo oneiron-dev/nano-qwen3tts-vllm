@@ -9,8 +9,13 @@ import time
 
 from .streaming_decoder import (
     StreamingDecoderState,
+    CUDAGraphStreamingState,
     init_streaming_state,
+    init_cudagraph_streaming_state,
     decode_incremental as _decode_incremental,
+    warmup_compiled_decoder,
+    capture_streaming_cudagraphs,
+    decode_cudagraph as _decode_cudagraph,
 )
 
 logger = logging.getLogger(__name__)
@@ -88,7 +93,7 @@ def _capture_decoder_cudagraphs(
             if elapsed_ms > 1.0:  # only log when non-trivial
                 logger.info(f"graph replay (launch) key={key} {elapsed_ms:.2f}ms")
             return decoder.graph_outputs[key]
-    
+
         logger.info(f"using original forward for key: {key}")
         return decoder.original_forward(codes)
 
@@ -147,6 +152,11 @@ class SpeechTokenizerCUDAGraph:
         self.device = device
         self.dtype = dtype
 
+        # Phase 2: CUDA graph state for streaming decode (lazy init)
+        self._streaming_graphs = None
+        self._streaming_graph_state = None
+        self._streaming_compiled_ready = False
+
         if device.startswith("cuda"):
             if graph_batch_sizes > 0 and graph_seq_lengths > 0:
                 batch_sizes = list(range(1, graph_batch_sizes + 1))
@@ -183,7 +193,7 @@ class SpeechTokenizerCUDAGraph:
             (wavs, sample_rate).
         """
         return self.tokenizer.decode(inputs)
-    
+
     @torch.inference_mode()
     def chunked_decode(
         self, inputs: List[dict], chunk_size: int = 300, left_context_size: int = 25,
@@ -313,19 +323,65 @@ class SpeechTokenizerCUDAGraph:
             yield wav_np, sr
             start = end
 
-    def init_streaming(self) -> StreamingDecoderState:
+    def init_streaming(self, mode: int = 1) -> StreamingDecoderState | CUDAGraphStreamingState:
         """Initialize streaming state for a new synthesis request.
 
-        Call this once per utterance, then pass the returned state to
-        decode_incremental() for each chunk of new codec frames.
+        Args:
+            mode: 1 = cached streaming (with optional torch.compile),
+                  2 = CUDA graph streaming (manual capture).
+
+        Returns:
+            Fresh state object. Pass to decode_incremental() or decode_incremental_cudagraph().
         """
-        return init_streaming_state()
+        decoder = self.tokenizer.model.decoder
+
+        if mode == 2:
+            return init_cudagraph_streaming_state(
+                decoder, device=self.device, dtype=self.dtype
+            )
+
+        return init_streaming_state(decoder, device=self.device, dtype=self.dtype)
+
+    def warmup_streaming(self, compile: bool = True, cudagraph: bool = False):
+        """Warmup streaming decode paths.
+
+        Args:
+            compile: Warmup torch.compile path (mode 1).
+            cudagraph: Warmup and capture CUDA graphs for streaming (mode 2).
+        """
+        decoder = self.tokenizer.model.decoder
+
+        if compile:
+            warmup_state = init_streaming_state(decoder, device=self.device, dtype=self.dtype)
+            warmup_compiled_decoder(decoder, warmup_state, device=self.device)
+            self._streaming_compiled_ready = True
+            logger.info("[streaming] torch.compile warmup complete")
+
+        if cudagraph:
+            graph_state = init_cudagraph_streaming_state(
+                decoder, device=self.device, dtype=self.dtype
+            )
+            self._streaming_graphs = capture_streaming_cudagraphs(
+                decoder, graph_state, device=self.device, chunk_sizes=[4, 1]
+            )
+            # Reset state after capture for clean inference
+            graph_state.kv_cache.reset()
+            graph_state.position_offset.zero_()
+            for c in graph_state.conv_caches:
+                if c.numel() > 0:
+                    c.zero_()
+            for c in graph_state.transconv_caches:
+                if c.numel() > 0:
+                    c.zero_()
+            self._streaming_graph_state = graph_state
+            logger.info("[streaming] CUDA graph warmup + capture complete")
 
     @torch.inference_mode()
     def decode_incremental(
         self,
         new_codes: torch.Tensor,
         state: StreamingDecoderState,
+        compiled: bool = True,
     ) -> Tuple[np.ndarray, int, StreamingDecoderState]:
         """Decode only new frames using cached streaming state.
 
@@ -335,6 +391,7 @@ class SpeechTokenizerCUDAGraph:
         Args:
             new_codes: [B, 16, N] new codec frames.
             state: StreamingDecoderState from init_streaming() or previous call.
+            compiled: If True and torch.compile is warmed up, use compiled path.
 
         Returns:
             (wav_new, sample_rate, state).
@@ -342,9 +399,10 @@ class SpeechTokenizerCUDAGraph:
         """
         decoder = self.tokenizer.model.decoder
         sr = int(self.tokenizer.model.get_output_sample_rate())
+        use_compiled = compiled and self._streaming_compiled_ready
 
         t0 = time.perf_counter()
-        wav = _decode_incremental(decoder, new_codes, state)
+        wav = _decode_incremental(decoder, new_codes, state, compiled=use_compiled)
         torch.cuda.synchronize()
         gpu_ms = (time.perf_counter() - t0) * 1000
 
@@ -353,9 +411,58 @@ class SpeechTokenizerCUDAGraph:
 
         logger.info(
             f"decode_incremental: gpu+sync={gpu_ms:.2f}ms total={total_ms:.2f}ms "
-            f"frames={new_codes.shape[2]} samples={len(wav_np)}"
+            f"frames={new_codes.shape[2]} samples={len(wav_np)} compiled={use_compiled}"
         )
         return wav_np, sr, state
+
+    @torch.inference_mode()
+    def decode_incremental_cudagraph(
+        self,
+        new_codes: torch.Tensor,
+    ) -> Tuple[np.ndarray, int]:
+        """Decode new frames using captured CUDA graphs (mode 2).
+
+        The CUDA graph state is maintained internally. Call warmup_streaming(cudagraph=True)
+        before first use. State resets are managed per-session externally.
+
+        Args:
+            new_codes: [B, 16, N] new codec frames.
+
+        Returns:
+            (wav_new, sample_rate).
+        """
+        if self._streaming_graphs is None:
+            raise RuntimeError(
+                "CUDA graph streaming not initialized. Call warmup_streaming(cudagraph=True) first."
+            )
+
+        sr = int(self.tokenizer.model.get_output_sample_rate())
+
+        t0 = time.perf_counter()
+        wav = _decode_cudagraph(new_codes, self._streaming_graphs, self._streaming_graph_state)
+        torch.cuda.synchronize()
+        gpu_ms = (time.perf_counter() - t0) * 1000
+
+        wav_np = wav.squeeze(0).squeeze(0).to(torch.float32).cpu().numpy()
+        total_ms = (time.perf_counter() - t0) * 1000
+
+        logger.info(
+            f"decode_incremental_cudagraph: gpu+sync={gpu_ms:.2f}ms total={total_ms:.2f}ms "
+            f"frames={new_codes.shape[2]} samples={len(wav_np)}"
+        )
+        return wav_np, sr
+
+    def reset_cudagraph_state(self):
+        """Reset CUDA graph streaming state for a new utterance."""
+        if self._streaming_graph_state is not None:
+            self._streaming_graph_state.kv_cache.reset()
+            self._streaming_graph_state.position_offset.zero_()
+            for c in self._streaming_graph_state.conv_caches:
+                if c.numel() > 0:
+                    c.zero_()
+            for c in self._streaming_graph_state.transconv_caches:
+                if c.numel() > 0:
+                    c.zero_()
 
     @torch.inference_mode()
     def decode_codec_ids(self, codec_ids: torch.Tensor) -> Tuple[List, int]:
