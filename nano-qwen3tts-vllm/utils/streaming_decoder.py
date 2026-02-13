@@ -608,13 +608,14 @@ def get_compiled_decoder():
     """Lazily compile the decode function with torch.compile."""
     global _compiled_decoder
     if _compiled_decoder is None:
-        # Use "max-autotune" not "reduce-overhead" — the latter captures
-        # internal CUDA graphs that conflict with mutable conv cache state
-        # passed between calls (cache tensors are both graph inputs & outputs)
-        logger.info("[streaming] compiling decode_incremental with torch.compile(mode='max-autotune')")
+        # Use "default" mode — "reduce-overhead" and "max-autotune" both
+        # capture internal CUDA graphs that conflict with mutable conv cache
+        # state passed between calls (cache tensors are graph inputs & outputs).
+        # "default" still gets Inductor kernel fusion without the graph issues.
+        logger.info("[streaming] compiling decode_incremental with torch.compile(mode='default')")
         _compiled_decoder = torch.compile(
             _decode_incremental_inner,
-            mode="max-autotune",
+            mode="default",
             fullgraph=False,   # Allow graph breaks at DynamicCache
             dynamic=False,     # N is always 1 or 4
         )
