@@ -362,7 +362,7 @@ class SpeechTokenizerCUDAGraph:
                 decoder, device=self.device, dtype=self.dtype
             )
             self._streaming_graphs = capture_streaming_cudagraphs(
-                decoder, graph_state, device=self.device, chunk_sizes=[4, 1]
+                decoder, graph_state, device=self.device, chunk_sizes=[1, 2, 3, 4]
             )
             # Reset state after capture for clean inference
             graph_state.kv_cache.reset()

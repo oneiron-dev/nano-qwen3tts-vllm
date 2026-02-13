@@ -137,6 +137,8 @@ class CUDAGraphStreamingState:
     # Map from string cache key to list index (built at init, used for debugging)
     conv_key_map: dict[str, int] = field(default_factory=dict)
     transconv_key_map: dict[str, int] = field(default_factory=dict)
+    # Reference to decoder module for eager fallback when chunk size has no captured graph
+    decoder: Optional[object] = None
 
 
 # ── Conv1d streaming ─────────────────────────────────────────────────
@@ -503,6 +505,9 @@ def init_cudagraph_streaming_state(
         dtype=dtype,
     )
 
+    # Store decoder reference for eager fallback in decode_cudagraph
+    state.decoder = decoder
+
     logger.info(
         "[streaming] CUDA graph state: %d conv caches, %d transconv caches, "
         "KV max_seq_len=%d",
@@ -822,7 +827,7 @@ def capture_streaming_cudagraphs(
     (call state.kv_cache.reset() and re-init conv/transconv caches).
     """
     if chunk_sizes is None:
-        chunk_sizes = [4, 1]
+        chunk_sizes = [1, 2, 3, 4]
 
     graphs = {}
     graph_pool = None
@@ -882,7 +887,7 @@ def decode_cudagraph(
     # Fallback to eager (shouldn't happen if chunk_sizes covers all emit sizes)
     logger.warning("[streaming] no CUDA graph for N=%d, using eager fallback", N)
     return _decode_graphable(
-        None, new_codes,  # decoder not available in this path
+        state.decoder, new_codes,
         state.conv_caches, state.transconv_caches,
         state.kv_cache, state.position_offset,
     )
