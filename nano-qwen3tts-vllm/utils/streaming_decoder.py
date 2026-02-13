@@ -49,11 +49,14 @@ class StreamingDecoderState:
 class StaticStreamingKVCache:
     """Drop-in for DynamicCache with pre-allocated fixed-size buffers.
 
-    All operations use tensor ops (no Python int tracking in hot path)
-    so this is compatible with CUDA graph capture.
+    Designed for CUDA graph compatibility:
+    - update() uses index_copy_ with tensor indices (no .item())
+    - Returns full max_seq_len buffer; attention mask handles valid positions
+    - get_mask_sizes() returns constant (max_seq_len, 0) for fixed mask shapes
 
-    The full max_seq_len buffer is always returned from update(); the
-    attention mask is responsible for masking unfilled positions.
+    The sliding_window=72 causal mask ensures attention only sees valid
+    positions: future positions are masked by causality, and positions
+    beyond the window are masked by sliding_window.
     """
 
     def __init__(
@@ -81,15 +84,26 @@ class StaticStreamingKVCache:
 
     def update(self, key_states, value_states, layer_idx, cache_kwargs=None):
         N = key_states.shape[2]
-        start = self._seq_len.item()
-        self.key_cache[layer_idx][:, :, start:start + N, :] = key_states
-        self.value_cache[layer_idx][:, :, start:start + N, :] = value_states
+        # Tensor-only indexing for CUDA graph compatibility (no .item())
+        indices = torch.arange(N, device=key_states.device) + self._seq_len.squeeze()
+        self.key_cache[layer_idx].index_copy_(2, indices, key_states)
+        self.value_cache[layer_idx].index_copy_(2, indices, value_states)
         if layer_idx == self._num_layers - 1:
             self._seq_len.add_(N)
-        return self.key_cache[layer_idx][:, :, :start + N, :], self.value_cache[layer_idx][:, :, :start + N, :]
+        # Return full buffer — causal + sliding window mask handles valid positions
+        return self.key_cache[layer_idx], self.value_cache[layer_idx]
 
     def get_seq_length(self, layer_idx=0):
         return self._seq_len.item()
+
+    def get_mask_sizes(self, cache_position, layer_idx=0):
+        """Return (kv_length, kv_offset) for attention mask creation.
+
+        Returns constant max_seq_len so mask shape is fixed across calls —
+        required for CUDA graph compatibility. The causal + sliding_window
+        mask handles which positions are actually valid.
+        """
+        return self._max_len, 0
 
     def get_max_cache_shape(self):
         return [self._max_len] * self._num_layers
@@ -598,6 +612,9 @@ def warmup_compiled_decoder(decoder, state: StreamingDecoderState, device: str =
     for N in [4, 1]:
         dummy = torch.zeros(1, 16, N, device=device, dtype=torch.long)
         with torch.inference_mode():
+            # Mark step boundary so torch.compile's internal CUDA graph
+            # management doesn't confuse cache tensors between runs
+            torch.compiler.cudagraph_mark_step_begin()
             compiled_fn(decoder, dummy, state)
         torch.cuda.synchronize()
 
@@ -624,6 +641,9 @@ def decode_incremental(
         The state is mutated in-place.
     """
     if compiled and _compiled_decoder is not None:
+        # Mark step boundary for torch.compile's internal CUDA graph
+        # management — prevents cache tensor overwrite errors between calls
+        torch.compiler.cudagraph_mark_step_begin()
         return _compiled_decoder(decoder, new_codes, state)
     return _decode_incremental_inner(decoder, new_codes, state)
 
