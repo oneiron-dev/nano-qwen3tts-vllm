@@ -204,7 +204,8 @@ class ModelRunner:
                 paged_kv_last_page_len_buffer=lpl_buf,
             )
 
-            # Scratch tensors for padded plan() calls during graph replay
+            self._fi_max_bs = max_bs
+            # Scratch tensors for padded plan() calls — always pad to max_bs
             self._fi_scratch_indptr = torch.zeros(max_bs + 1, dtype=torch.int32, device="cuda")
             self._fi_scratch_lpl = torch.ones(max_bs, dtype=torch.int32, device="cuda")
         else:
@@ -223,22 +224,23 @@ class ModelRunner:
         )
 
     def _fi_plan(self, batch_size, fi_indptr, fi_indices, fi_last_page_len):
-        """Call FlashInfer plan() for decode. Pads metadata to batch_size for CUDA graph compat."""
+        """Call FlashInfer plan() for decode. Always pads to _fi_max_bs in CUDA graph mode."""
         if self.fi_wrapper is None:
             return
 
         actual_bs = fi_indptr.size(0) - 1
+        target_bs = self._fi_max_bs if not self.enforce_eager else actual_bs
 
-        if not self.enforce_eager and batch_size > actual_bs:
-            # Pad to graph batch size
+        if target_bs > actual_bs:
+            # Pad to fixed max batch size (FlashInfer CUDA graph mode requires constant bs)
             self._fi_scratch_indptr[:actual_bs + 1].copy_(fi_indptr)
-            self._fi_scratch_indptr[actual_bs + 1:batch_size + 1] = self._fi_scratch_indptr[actual_bs]
+            self._fi_scratch_indptr[actual_bs + 1:target_bs + 1] = self._fi_scratch_indptr[actual_bs]
 
             self._fi_scratch_lpl[:actual_bs].copy_(fi_last_page_len)
-            self._fi_scratch_lpl[actual_bs:batch_size].fill_(1)
+            self._fi_scratch_lpl[actual_bs:target_bs].fill_(1)
 
-            fi_indptr = self._fi_scratch_indptr[:batch_size + 1]
-            fi_last_page_len = self._fi_scratch_lpl[:batch_size]
+            fi_indptr = self._fi_scratch_indptr[:target_bs + 1]
+            fi_last_page_len = self._fi_scratch_lpl[:target_bs]
 
         self.fi_wrapper.plan(
             fi_indptr, fi_indices, fi_last_page_len,
