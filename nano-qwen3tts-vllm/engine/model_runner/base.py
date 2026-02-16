@@ -169,80 +169,102 @@ class ModelRunner:
     # ---- FlashInfer integration ----
 
     def _init_flashinfer(self):
-        """Initialize FlashInfer decode wrapper (if available)."""
+        """Initialize FlashInfer (if available). Wrappers created later in _fi_create_wrappers()."""
         try:
             import flashinfer
             self._flashinfer = flashinfer
         except ImportError:
             self.fi_wrapper = None
+            self._fi_wrappers = {}
             return
 
         hf_config = self.model_config
-        num_kv_heads = hf_config.num_key_value_heads // self.world_size
-        num_qo_heads = hf_config.num_attention_heads // self.world_size
-        head_dim = getattr(hf_config, "head_dim", None) or hf_config.hidden_size // hf_config.num_attention_heads
+        self._fi_num_kv_heads = hf_config.num_key_value_heads // self.world_size
+        self._fi_num_qo_heads = hf_config.num_attention_heads // self.world_size
+        self._fi_head_dim = getattr(hf_config, "head_dim", None) or hf_config.hidden_size // hf_config.num_attention_heads
+        self._fi_max_num_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size
 
-        self._fi_num_qo_heads = num_qo_heads
-        self._fi_num_kv_heads = num_kv_heads
-        self._fi_head_dim = head_dim
+        # Shared workspace buffer (reused by all per-bs wrappers)
+        self._fi_workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+        self._fi_wrappers = {}  # graph_bs -> wrapper (populated in _fi_create_wrappers)
+        self.fi_wrapper = None  # active wrapper (set in _fi_plan)
 
-        max_bs = min(self.config.max_num_seqs, 512)
-        max_num_blocks = (self.config.max_model_len + self.block_size - 1) // self.block_size
-        max_pages = max_bs * max_num_blocks
+        # Collect attention modules for fast wrapper swapping
+        self._fi_attn_modules = [m for m in self.model.modules() if hasattr(m, "fi_wrapper")]
 
-        workspace = torch.empty(128 * 1024 * 1024, dtype=torch.uint8, device="cuda")
+        if self.enforce_eager:
+            # Single eager wrapper (no fixed batch size constraint)
+            self.fi_wrapper = self._flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                self._fi_workspace, kv_layout="NHD", use_cuda_graph=False,
+            )
+            for m in self._fi_attn_modules:
+                m.fi_wrapper = self.fi_wrapper
 
-        if not self.enforce_eager:
-            indptr_buf = torch.zeros(max_bs + 1, dtype=torch.int32, device="cuda")
-            indices_buf = torch.zeros(max_pages, dtype=torch.int32, device="cuda")
-            lpl_buf = torch.ones(max_bs, dtype=torch.int32, device="cuda")
+        logger.info(
+            f"[flashinfer] Initialized (eager={self.enforce_eager}, "
+            f"qo_heads={self._fi_num_qo_heads}, kv_heads={self._fi_num_kv_heads}, "
+            f"head_dim={self._fi_head_dim})"
+        )
 
-            self.fi_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                workspace, kv_layout="NHD", use_cuda_graph=True,
+    def _fi_create_wrappers(self, graph_bs_list):
+        """Create one FlashInfer wrapper per graph batch size for CUDA graph compat."""
+        if not hasattr(self, "_flashinfer") or self.enforce_eager:
+            return
+
+        flashinfer = self._flashinfer
+        max_num_blocks = self._fi_max_num_blocks
+
+        for bs in graph_bs_list:
+            max_pages = bs * max_num_blocks
+            indptr_buf = torch.zeros(bs + 1, dtype=torch.int32, device="cuda")
+            indices_buf = torch.zeros(max(max_pages, 1), dtype=torch.int32, device="cuda")
+            lpl_buf = torch.ones(bs, dtype=torch.int32, device="cuda")
+
+            wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
+                self._fi_workspace, kv_layout="NHD", use_cuda_graph=True,
                 paged_kv_indptr_buffer=indptr_buf,
                 paged_kv_indices_buffer=indices_buf,
                 paged_kv_last_page_len_buffer=lpl_buf,
             )
+            self._fi_wrappers[bs] = wrapper
 
-            self._fi_max_bs = max_bs
-            # Scratch tensors for padded plan() calls — always pad to max_bs
-            self._fi_scratch_indptr = torch.zeros(max_bs + 1, dtype=torch.int32, device="cuda")
-            self._fi_scratch_lpl = torch.ones(max_bs, dtype=torch.int32, device="cuda")
-        else:
-            self.fi_wrapper = flashinfer.BatchDecodeWithPagedKVCacheWrapper(
-                workspace, kv_layout="NHD", use_cuda_graph=False,
-            )
+        # Scratch tensors for padding actual_bs -> graph_bs
+        max_bs = max(graph_bs_list)
+        self._fi_scratch_indptr = torch.zeros(max_bs + 1, dtype=torch.int32, device="cuda")
+        self._fi_scratch_lpl = torch.ones(max_bs, dtype=torch.int32, device="cuda")
 
-        # Assign wrapper to all Attention layers
-        for module in self.model.modules():
-            if hasattr(module, "fi_wrapper"):
-                module.fi_wrapper = self.fi_wrapper
-
-        logger.info(
-            f"[flashinfer] Initialized decode wrapper (cuda_graph={not self.enforce_eager}, "
-            f"qo_heads={num_qo_heads}, kv_heads={num_kv_heads}, head_dim={head_dim})"
-        )
+        logger.info(f"[flashinfer] Created {len(graph_bs_list)} per-bs wrappers")
 
     def _fi_plan(self, batch_size, fi_indptr, fi_indices, fi_last_page_len):
-        """Call FlashInfer plan() for decode. Always pads to _fi_max_bs in CUDA graph mode."""
-        if self.fi_wrapper is None:
+        """Call FlashInfer plan() for decode. Selects per-bs wrapper and pads metadata."""
+        if not self._fi_wrappers and self.fi_wrapper is None:
             return
 
-        actual_bs = fi_indptr.size(0) - 1
-        target_bs = self._fi_max_bs if not self.enforce_eager else actual_bs
+        if not self.enforce_eager:
+            # CUDA graph mode: use per-bs wrapper
+            wrapper = self._fi_wrappers.get(batch_size)
+            if wrapper is None:
+                return
 
-        if target_bs > actual_bs:
-            # Pad to fixed max batch size (FlashInfer CUDA graph mode requires constant bs)
-            self._fi_scratch_indptr[:actual_bs + 1].copy_(fi_indptr)
-            self._fi_scratch_indptr[actual_bs + 1:target_bs + 1] = self._fi_scratch_indptr[actual_bs]
+            # Swap active wrapper on all attention layers
+            if self.fi_wrapper is not wrapper:
+                self.fi_wrapper = wrapper
+                for m in self._fi_attn_modules:
+                    m.fi_wrapper = wrapper
 
-            self._fi_scratch_lpl[:actual_bs].copy_(fi_last_page_len)
-            self._fi_scratch_lpl[actual_bs:target_bs].fill_(1)
+            # Pad actual_bs to graph batch_size
+            actual_bs = fi_indptr.size(0) - 1
+            if batch_size > actual_bs:
+                self._fi_scratch_indptr[:actual_bs + 1].copy_(fi_indptr)
+                self._fi_scratch_indptr[actual_bs + 1:batch_size + 1] = self._fi_scratch_indptr[actual_bs]
+                self._fi_scratch_lpl[:actual_bs].copy_(fi_last_page_len)
+                self._fi_scratch_lpl[actual_bs:batch_size].fill_(1)
+                fi_indptr = self._fi_scratch_indptr[:batch_size + 1]
+                fi_last_page_len = self._fi_scratch_lpl[:batch_size]
+        else:
+            wrapper = self.fi_wrapper
 
-            fi_indptr = self._fi_scratch_indptr[:target_bs + 1]
-            fi_last_page_len = self._fi_scratch_lpl[:target_bs]
-
-        self.fi_wrapper.plan(
+        wrapper.plan(
             fi_indptr, fi_indices, fi_last_page_len,
             num_qo_heads=self._fi_num_qo_heads,
             num_kv_heads=self._fi_num_kv_heads,
@@ -253,7 +275,7 @@ class ModelRunner:
 
     def _build_fi_metadata(self, seqs):
         """Convert sequence block tables to FlashInfer CSR page-table format."""
-        if self.fi_wrapper is None:
+        if not self._fi_wrappers and self.fi_wrapper is None:
             return None, None, None
 
         indptr = [0]
@@ -355,7 +377,7 @@ class ModelRunner:
         model_input = input_embeds if input_embeds is not None else input_ids
 
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512 or input_embeds is not None:
-            if not is_prefill and self.fi_wrapper is not None:
+            if not is_prefill and (self._fi_wrappers or self.fi_wrapper is not None):
                 context = get_context()
                 self._fi_plan(input_ids.size(0), context.fi_indptr, context.fi_indices, context.fi_last_page_len)
             return self.model.compute_logits(self.model(model_input, positions))
@@ -372,7 +394,7 @@ class ModelRunner:
             graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
-            if self.fi_wrapper is not None:
+            if self._fi_wrappers:
                 self._fi_plan(graph_bs, context.fi_indptr, context.fi_indices, context.fi_last_page_len)
             graph.replay()
             return self.model.compute_logits(graph_vars["outputs"][:bs])
@@ -406,16 +428,19 @@ class ModelRunner:
         self.graphs = {}
         self.graph_pool = None
 
+        # Create per-bs FlashInfer wrappers before graph capture
+        self._fi_create_wrappers(self.graph_bs)
+
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
-            if self.fi_wrapper is not None:
+            if self._fi_wrappers:
                 dummy_indptr = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
                 dummy_indices = torch.zeros(bs, dtype=torch.int32, device="cuda")
                 dummy_lpl = torch.ones(bs, dtype=torch.int32, device="cuda")
                 self._fi_plan(bs, dummy_indptr, dummy_indices, dummy_lpl)
             outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # warmup
-            if self.fi_wrapper is not None:
+            if self._fi_wrappers:
                 self._fi_plan(bs, dummy_indptr, dummy_indices, dummy_lpl)
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_ids[:bs], positions[:bs])    # capture
