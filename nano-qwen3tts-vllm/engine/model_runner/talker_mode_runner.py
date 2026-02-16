@@ -100,7 +100,17 @@ class TalkerModeModelRunner(ModelRunner):
                 graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
                 if self._fi_wrappers:
                     self._fi_update_buffers(graph_bs, context.fi_indptr, context.fi_indices, context.fi_last_page_len)
+                log_this = self._fi_debug or (hasattr(self, '_fi_update_call_count') and self._fi_update_call_count <= 5)
+                if log_this:
+                    logger.info("[run_model:talker] pre-replay: bs=%d graph_bs=%d fi_wrappers=%s", bs, graph_bs, bool(self._fi_wrappers))
                 graph.replay()
+                if log_this:
+                    import torch as _torch
+                    _torch.cuda.synchronize()
+                    out = graph_vars["outputs"][:bs]
+                    has_nan = _torch.isnan(out).any().item()
+                    has_inf = _torch.isinf(out).any().item()
+                    logger.info("[run_model:talker] post-replay: norm=%.4f nan=%s inf=%s", out.norm().item(), has_nan, has_inf)
 
                 hidden_states = graph_vars["outputs"][:bs]
             

@@ -186,7 +186,8 @@ class ModelRunner:
 
         self._fi_wrappers = {}  # graph_bs -> wrapper (populated in _fi_create_wrappers)
         self._fi_buffers = {}   # graph_bs -> wrapper buffers (kept alive for graph replay)
-        self._fi_debug = os.getenv("NANO_QWEN3TTS_FI_DEBUG", "0") == "1"
+        self._fi_debug = os.getenv("NANO_QWEN3TTS_FI_DEBUG", "0") == "1" or os.getenv("FLASHINFER_DEBUG", "0") == "1"
+        self._fi_update_call_count = 0  # track calls for first-call unconditional logging
         self.fi_wrapper = None  # active wrapper (set in _fi_plan)
 
         # Collect attention modules for fast wrapper swapping
@@ -257,24 +258,28 @@ class ModelRunner:
 
     def _fi_update_buffers(self, graph_bs, fi_indptr, fi_indices, fi_last_page_len):
         """Update FlashInfer page-table buffers without calling plan() on graph replay."""
+        self._fi_update_call_count += 1
+        log_this = self._fi_debug or self._fi_update_call_count <= 5
+
         if not self._fi_wrappers:
-            if self._fi_debug:
-                logger.info("[fi_update] no wrappers, returning")
+            if log_this:
+                logger.info("[fi_update] call#%d no wrappers, returning", self._fi_update_call_count)
             return
 
         bufs = self._fi_buffers.get(graph_bs)
         if bufs is None:
-            if self._fi_debug:
-                logger.warning("[fi_update] no buffers for graph_bs=%d, available=%s", graph_bs, list(self._fi_buffers.keys())[:5])
+            if log_this:
+                logger.warning("[fi_update] call#%d no buffers for graph_bs=%d, available=%s",
+                               self._fi_update_call_count, graph_bs, list(self._fi_buffers.keys())[:5])
             return
 
         actual_bs = fi_indptr.size(0) - 1
         total_real_pages = fi_indices.size(0)
 
-        if self._fi_debug:
+        if log_this:
             logger.info(
-                "[fi_update] graph_bs=%d actual_bs=%d pages=%d indptr=%s indices=%s lpl=%s",
-                graph_bs, actual_bs, total_real_pages,
+                "[fi_update] call#%d graph_bs=%d actual_bs=%d pages=%d indptr=%s indices=%s lpl=%s",
+                self._fi_update_call_count, graph_bs, actual_bs, total_real_pages,
                 fi_indptr.tolist(), fi_indices.tolist()[:8], fi_last_page_len.tolist()
             )
 
@@ -487,12 +492,16 @@ class ModelRunner:
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             if self._fi_wrappers:
                 self._fi_update_buffers(graph_bs, context.fi_indptr, context.fi_indices, context.fi_last_page_len)
-            if self._fi_debug:
-                logger.info("[run_model] graph replay: bs=%d graph_bs=%d fi_wrappers=%s", bs, graph_bs, bool(self._fi_wrappers))
+            log_this = self._fi_debug or (hasattr(self, '_fi_update_call_count') and self._fi_update_call_count <= 5)
+            if log_this:
+                logger.info("[run_model:base] pre-replay: bs=%d graph_bs=%d fi_wrappers=%s", bs, graph_bs, bool(self._fi_wrappers))
             graph.replay()
-            if self._fi_debug:
+            if log_this:
                 torch.cuda.synchronize()
-                logger.info("[run_model] graph replay done, outputs[:bs] norm=%.4f", graph_vars["outputs"][:bs].norm().item())
+                out = graph_vars["outputs"][:bs]
+                has_nan = torch.isnan(out).any().item()
+                has_inf = torch.isinf(out).any().item()
+                logger.info("[run_model:base] post-replay: norm=%.4f nan=%s inf=%s", out.norm().item(), has_nan, has_inf)
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
