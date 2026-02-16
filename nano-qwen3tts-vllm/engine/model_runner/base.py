@@ -246,6 +246,7 @@ class ModelRunner:
             num_kv_heads=self._fi_num_kv_heads,
             head_dim=self._fi_head_dim,
             page_size=self.block_size,
+            q_data_type=torch.bfloat16,
         )
 
     def _build_fi_metadata(self, seqs):
