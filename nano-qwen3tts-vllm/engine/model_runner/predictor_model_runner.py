@@ -118,7 +118,7 @@ class PredictorModelRunner(ModelRunner):
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             if self._fi_wrappers:
-                self._fi_plan(graph_bs, context.fi_indptr, context.fi_indices, context.fi_last_page_len)
+                self._fi_update_buffers(graph_bs, context.fi_indptr, context.fi_indices, context.fi_last_page_len)
             graph.replay()
             # Use outputs from the graph; do NOT run self.model() again (that would double the work).
             hidden_states = graph_vars["outputs"][:bs]
@@ -180,9 +180,9 @@ class PredictorModelRunner(ModelRunner):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
             if self._fi_wrappers:
-                dummy_indptr = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
-                dummy_indices = torch.zeros(bs, dtype=torch.int32, device="cuda")
-                dummy_lpl = torch.ones(bs, dtype=torch.int32, device="cuda")
+                dummy_indptr = torch.arange(bs + 1, dtype=torch.int32, device="cuda") * max_num_blocks
+                dummy_indices = torch.zeros(bs * max_num_blocks, dtype=torch.int32, device="cuda")
+                dummy_lpl = torch.full((bs,), self.block_size, dtype=torch.int32, device="cuda")
                 self._fi_plan(bs, dummy_indptr, dummy_indices, dummy_lpl)
             input_embeds[:bs].copy_(
                 self.model.get_input_embeddings(input_ids[:bs], None, generation_steps[:bs])
@@ -247,4 +247,3 @@ class PredictorModelRunner(ModelRunner):
             slot_mapping=slot_mapping,
             outputs=outputs,
         )
-

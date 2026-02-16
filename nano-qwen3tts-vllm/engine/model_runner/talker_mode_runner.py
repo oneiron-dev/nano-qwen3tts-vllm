@@ -99,7 +99,7 @@ class TalkerModeModelRunner(ModelRunner):
                 graph_vars["context_lens"][:bs] = context.context_lens
                 graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
                 if self._fi_wrappers:
-                    self._fi_plan(graph_bs, context.fi_indptr, context.fi_indices, context.fi_last_page_len)
+                    self._fi_update_buffers(graph_bs, context.fi_indptr, context.fi_indices, context.fi_last_page_len)
                 graph.replay()
 
                 hidden_states = graph_vars["outputs"][:bs]
@@ -181,9 +181,9 @@ class TalkerModeModelRunner(ModelRunner):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
             if self._fi_wrappers:
-                dummy_indptr = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
-                dummy_indices = torch.zeros(bs, dtype=torch.int32, device="cuda")
-                dummy_lpl = torch.ones(bs, dtype=torch.int32, device="cuda")
+                dummy_indptr = torch.arange(bs + 1, dtype=torch.int32, device="cuda") * max_num_blocks
+                dummy_indices = torch.zeros(bs * max_num_blocks, dtype=torch.int32, device="cuda")
+                dummy_lpl = torch.full((bs,), self.block_size, dtype=torch.int32, device="cuda")
                 self._fi_plan(bs, dummy_indptr, dummy_indices, dummy_lpl)
             outputs[:bs] = self.model(input_embeds[:bs], positions[:bs])    # warmup
             if self._fi_wrappers:
