@@ -491,10 +491,11 @@ class ModelRunner:
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             if self._fi_wrappers:
-                self._fi_update_buffers(graph_bs, context.fi_indptr, context.fi_indices, context.fi_last_page_len)
+                # DIAGNOSTIC: use full plan() instead of skip-plan to test hypothesis
+                self._fi_plan(graph_bs, context.fi_indptr, context.fi_indices, context.fi_last_page_len)
             log_this = self._fi_debug or (hasattr(self, '_fi_update_call_count') and self._fi_update_call_count <= 5)
             if log_this:
-                logger.info("[run_model:base] pre-replay: bs=%d graph_bs=%d fi_wrappers=%s", bs, graph_bs, bool(self._fi_wrappers))
+                logger.info("[run_model:base] pre-replay (plan mode): bs=%d graph_bs=%d fi_wrappers=%s", bs, graph_bs, bool(self._fi_wrappers))
             graph.replay()
             if log_this:
                 torch.cuda.synchronize()
