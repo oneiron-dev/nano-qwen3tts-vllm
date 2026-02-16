@@ -258,14 +258,25 @@ class ModelRunner:
     def _fi_update_buffers(self, graph_bs, fi_indptr, fi_indices, fi_last_page_len):
         """Update FlashInfer page-table buffers without calling plan() on graph replay."""
         if not self._fi_wrappers:
+            if self._fi_debug:
+                logger.info("[fi_update] no wrappers, returning")
             return
 
         bufs = self._fi_buffers.get(graph_bs)
         if bufs is None:
+            if self._fi_debug:
+                logger.warning("[fi_update] no buffers for graph_bs=%d, available=%s", graph_bs, list(self._fi_buffers.keys())[:5])
             return
 
         actual_bs = fi_indptr.size(0) - 1
         total_real_pages = fi_indices.size(0)
+
+        if self._fi_debug:
+            logger.info(
+                "[fi_update] graph_bs=%d actual_bs=%d pages=%d indptr=%s indices=%s lpl=%s",
+                graph_bs, actual_bs, total_real_pages,
+                fi_indptr.tolist(), fi_indices.tolist()[:8], fi_last_page_len.tolist()
+            )
 
         if self._fi_debug:
             assert fi_indptr.size(0) == actual_bs + 1, "fi_indptr size mismatch"
@@ -476,7 +487,12 @@ class ModelRunner:
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
             if self._fi_wrappers:
                 self._fi_update_buffers(graph_bs, context.fi_indptr, context.fi_indices, context.fi_last_page_len)
+            if self._fi_debug:
+                logger.info("[run_model] graph replay: bs=%d graph_bs=%d fi_wrappers=%s", bs, graph_bs, bool(self._fi_wrappers))
             graph.replay()
+            if self._fi_debug:
+                torch.cuda.synchronize()
+                logger.info("[run_model] graph replay done, outputs[:bs] norm=%.4f", graph_vars["outputs"][:bs].norm().item())
             return self.model.compute_logits(graph_vars["outputs"][:bs])
 
     def run(self, seqs: list[Sequence], is_prefill: bool) -> list[int]:
