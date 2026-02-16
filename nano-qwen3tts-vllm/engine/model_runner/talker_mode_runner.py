@@ -54,6 +54,9 @@ class TalkerModeModelRunner(ModelRunner):
         start = time.time()
         model_input = input_embeds if input_embeds is not None else input_ids
         if is_prefill or self.enforce_eager or input_ids.size(0) > 512:
+            if not is_prefill and self.fi_wrapper is not None:
+                context = get_context()
+                self._fi_plan(input_ids.size(0), context.fi_indptr, context.fi_indices, context.fi_last_page_len)
             hidden_states = self.model(model_input, positions)
         else:
             if is_prefill:
@@ -85,7 +88,8 @@ class TalkerModeModelRunner(ModelRunner):
             else:
                 bs = input_embeds.size(0)
                 context = get_context()
-                graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+                graph_bs = next(x for x in self.graph_bs if x >= bs)
+                graph = self.graphs[graph_bs]
                 graph_vars = self.graph_vars
                 graph_vars["input_embeds"][:bs] = model_input
                 graph_vars["positions"][:bs] = positions
@@ -94,8 +98,10 @@ class TalkerModeModelRunner(ModelRunner):
                 graph_vars["context_lens"].zero_()
                 graph_vars["context_lens"][:bs] = context.context_lens
                 graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+                if self.fi_wrapper is not None:
+                    self._fi_plan(graph_bs, context.fi_indptr, context.fi_indices, context.fi_last_page_len)
                 graph.replay()
-                
+
                 hidden_states = graph_vars["outputs"][:bs]
             
         logits = self.model.compute_logits(hidden_states)
@@ -131,7 +137,9 @@ class TalkerModeModelRunner(ModelRunner):
         slot_mapping = torch.tensor(slot_mapping, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         context_lens = torch.tensor(context_lens, dtype=torch.int32, pin_memory=True).cuda(non_blocking=True)
         block_tables = self.prepare_block_tables(seqs)
-        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables)
+        fi_indptr, fi_indices, fi_last_page_len = self._build_fi_metadata(seqs)
+        set_context(False, slot_mapping=slot_mapping, context_lens=context_lens, block_tables=block_tables,
+                    fi_indptr=fi_indptr, fi_indices=fi_indices, fi_last_page_len=fi_last_page_len)
         input_ids = torch.zeros(len(seqs), dtype=torch.int64, device="cuda")
         return input_ids, input_embeds, positions
 
@@ -169,7 +177,14 @@ class TalkerModeModelRunner(ModelRunner):
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            if self.fi_wrapper is not None:
+                dummy_indptr = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
+                dummy_indices = torch.zeros(bs, dtype=torch.int32, device="cuda")
+                dummy_lpl = torch.ones(bs, dtype=torch.int32, device="cuda")
+                self._fi_plan(bs, dummy_indptr, dummy_indices, dummy_lpl)
             outputs[:bs] = self.model(input_embeds[:bs], positions[:bs])    # warmup
+            if self.fi_wrapper is not None:
+                self._fi_plan(bs, dummy_indptr, dummy_indices, dummy_lpl)
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_embeds[:bs], positions[:bs])    # capture
             if self.graph_pool is None:

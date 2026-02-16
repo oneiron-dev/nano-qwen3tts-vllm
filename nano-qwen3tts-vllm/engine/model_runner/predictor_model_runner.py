@@ -71,8 +71,11 @@ class PredictorModelRunner(ModelRunner):
         is_prefill: bool = False,
         generation_steps: list[int] = [],
     ) -> torch.Tensor:
-        start = time.time()        
+        start = time.time()
         if self.enforce_eager or input_embeds.size(0) > 512:
+            if not is_prefill and self.fi_wrapper is not None:
+                context = get_context()
+                self._fi_plan(input_embeds.size(0), context.fi_indptr, context.fi_indices, context.fi_last_page_len)
             hidden_states = self.model(input_embeds, positions)
         elif is_prefill:
             # get_input_embeddings returns 3D [1, total_tokens, hidden] for prefill
@@ -104,7 +107,8 @@ class PredictorModelRunner(ModelRunner):
         else:
             bs = input_embeds.size(0)
             context = get_context()
-            graph = self.graphs[next(x for x in self.graph_bs if x >= bs)]
+            graph_bs = next(x for x in self.graph_bs if x >= bs)
+            graph = self.graphs[graph_bs]
             graph_vars = self.graph_vars
             graph_vars["input_embeds"][:bs] = input_embeds
             graph_vars["positions"][:bs] = positions
@@ -113,6 +117,8 @@ class PredictorModelRunner(ModelRunner):
             graph_vars["context_lens"].zero_()
             graph_vars["context_lens"][:bs] = context.context_lens
             graph_vars["block_tables"][:bs, :context.block_tables.size(1)] = context.block_tables
+            if self.fi_wrapper is not None:
+                self._fi_plan(graph_bs, context.fi_indptr, context.fi_indices, context.fi_last_page_len)
             graph.replay()
             # Use outputs from the graph; do NOT run self.model() again (that would double the work).
             hidden_states = graph_vars["outputs"][:bs]
@@ -170,10 +176,17 @@ class PredictorModelRunner(ModelRunner):
         for bs in reversed(self.graph_bs):
             graph = torch.cuda.CUDAGraph()
             set_context(False, slot_mapping=slot_mapping[:bs], context_lens=context_lens[:bs], block_tables=block_tables[:bs])
+            if self.fi_wrapper is not None:
+                dummy_indptr = torch.arange(bs + 1, dtype=torch.int32, device="cuda")
+                dummy_indices = torch.zeros(bs, dtype=torch.int32, device="cuda")
+                dummy_lpl = torch.ones(bs, dtype=torch.int32, device="cuda")
+                self._fi_plan(bs, dummy_indptr, dummy_indices, dummy_lpl)
             input_embeds[:bs].copy_(
                 self.model.get_input_embeddings(input_ids[:bs], None, generation_steps[:bs])
             )
             outputs[:bs] = self.model(input_embeds[:bs], positions[:bs])    # warmup
+            if self.fi_wrapper is not None:
+                self._fi_plan(bs, dummy_indptr, dummy_indices, dummy_lpl)
             with torch.cuda.graph(graph, self.graph_pool):
                 outputs[:bs] = self.model(input_embeds[:bs], positions[:bs])    # capture
             if self.graph_pool is None:
